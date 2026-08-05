@@ -93,6 +93,10 @@ _HERMES_CORE_TOOLS = [
 # default ops surface. New operational tools added to the core list flow into
 # ops unless they are explicitly classified as non-ops here.
 _OPS_EXCLUDED_TOOLS = frozenset({
+    # Subagents and desktop control are intentionally opt-in. The default
+    # server-ops profile must not create child agents or control a desktop.
+    "delegate_task",
+    "computer_use",
     "react_to_message",
     "vision_analyze",
     "image_generate",
@@ -495,7 +499,8 @@ TOOLSETS = {
     "ops": {
         "description": (
             "Safe operations profile: terminal, files, code, browser, HTTP/web, "
-            "skills, memory, session search, delegation, cron, MCP and wiki. "
+            "skills, memory, session search, cron, MCP and wiki. Delegation, "
+            "desktop control, messaging, and media generation are opt-in. "
             "Pair with approvals.mode=every_tool."
         ),
         "tools": _OPS_TOOLS,

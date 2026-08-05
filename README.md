@@ -158,8 +158,9 @@ wiki:
 ```
 
 The `ops` profile includes terminal, files, code execution, browser/web,
-HTTP, skills, memory, session search, delegation, cron, MCP, and the operator
-wiki. Third-party messaging and creative/media tools remain opt-in.
+HTTP, skills, memory, session search, cron, MCP, and the operator wiki.
+Delegation/subagents, desktop computer-use, third-party messaging, and
+creative/media or speech tools remain opt-in.
 
 Cron management actions require approval, and every actual scheduled run
 requires a fresh approval. A denied, expired, or unavailable approval pauses

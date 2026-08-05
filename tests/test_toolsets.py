@@ -68,6 +68,20 @@ class TestResolveToolset:
         assert "web_search" in tools
         assert "web_extract" in tools
 
+    def test_ops_excludes_non_ops_capabilities(self):
+        tools = set(resolve_toolset("ops"))
+        assert "delegate_task" not in tools
+        assert "computer_use" not in tools
+        assert "image_generate" not in tools
+        assert "video_generate" not in tools
+        assert "text_to_speech" not in tools
+        assert "discord" not in tools
+        assert "discord_admin" not in tools
+
+        description = TOOLSETS["ops"]["description"].lower()
+        assert "delegation" in description
+        assert "opt-in" in description
+
     def test_cycle_detection(self):
         # Create a cycle: A includes B, B includes A
         TOOLSETS["_cycle_a"] = {"description": "test", "tools": ["t1"], "includes": ["_cycle_b"]}
