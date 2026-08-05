@@ -15,12 +15,23 @@ import threading
 import time
 from unittest.mock import patch
 
+import pytest
+
 from tools.cronjob_tools import cronjob, _execute_job_now
 from tools.environments.base import set_activity_callback
 
 
 _JOB = {"id": "job-run-1", "name": "manual run", "prompt": "hi",
         "schedule": {"kind": "cron", "expr": "0 9 * * *"}}
+
+
+@pytest.fixture(autouse=True)
+def _exercise_legacy_immediate_run(monkeypatch):
+    """Keep legacy immediate-run behavior separate from strict cron HITL."""
+    monkeypatch.setattr(
+        "tools.strict_approval._strict_config",
+        lambda: (False, 0.0),
+    )
 
 
 class TestCronjobRunExecutesImmediately:
@@ -74,7 +85,7 @@ class TestCronjobRunExecutesImmediately:
 
         set_activity_callback(record)
         try:
-            def slow_run(job):
+            def slow_run(job, **_kwargs):
                 # Deterministic: block until at least one heartbeat has fired
                 # (bounded so a broken heartbeat can't hang the test).
                 assert heartbeat_seen.wait(timeout=5.0), "no heartbeat within 5s"
@@ -123,7 +134,7 @@ class TestCronjobRunExecutesImmediately:
 
         set_activity_callback(record)
         try:
-            def slow_run(job):
+            def slow_run(job, **_kwargs):
                 # Ceiling=0 → the very first wake stops the loop without
                 # touching. Give it a couple of cycles to prove silence.
                 time.sleep(0.2)
@@ -156,7 +167,7 @@ class TestCronjobRunExecutesImmediately:
 
         set_activity_callback(flaky)
         try:
-            def slow_run(job):
+            def slow_run(job, **_kwargs):
                 # Block until a heartbeat AFTER the raising one has fired.
                 assert second_beat.wait(timeout=5.0), \
                     "heartbeat stopped after one callback exception"

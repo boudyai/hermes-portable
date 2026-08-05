@@ -18,6 +18,22 @@ from hermes_cli.cron import (
 )
 
 
+@pytest.fixture(autouse=True)
+def _exercise_legacy_lifecycle_guards(monkeypatch):
+    """Keep this module focused on the legacy lifecycle guard behavior.
+
+    The fork defaults to the stricter every-tool Telegram gate, which would
+    correctly block these direct handler calls before the lifecycle-specific
+    guard under test. Explicitly select legacy mode here so this suite keeps
+    exercising its intended boundary; strict-mode coverage lives in
+    tests/tools/test_strict_global_approval.py.
+    """
+    monkeypatch.setattr(
+        "tools.strict_approval._strict_config",
+        lambda: (False, 0.0),
+    )
+
+
 # ---------------------------------------------------------------------------
 # Defense 2: _contains_gateway_lifecycle_command pattern tests
 # ---------------------------------------------------------------------------

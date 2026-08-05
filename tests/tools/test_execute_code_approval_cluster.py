@@ -27,6 +27,15 @@ from tools.thread_context import propagate_context_to_thread
 from gateway.session_context import clear_session_vars, reset_session_vars, set_session_vars
 
 
+@pytest.fixture(autouse=True)
+def _exercise_legacy_approval_cluster(monkeypatch):
+    """This module validates the legacy manual/smart approval machinery."""
+    monkeypatch.setattr(
+        "tools.strict_approval._strict_config",
+        lambda: (False, 0.0),
+    )
+
+
 # ---------------------------------------------------------------------------
 # 1. Context + callback propagation helper
 # ---------------------------------------------------------------------------
