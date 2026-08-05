@@ -162,6 +162,11 @@ HTTP, skills, memory, session search, cron, MCP, and the operator wiki.
 Delegation/subagents, desktop computer-use, third-party messaging, and
 creative/media or speech tools remain opt-in.
 
+The production-oriented personality used by this fork is available at
+[`deploy/strict-ops/SOUL.md`](deploy/strict-ops/SOUL.md). Install it as
+`$HERMES_HOME/SOUL.md`; Hermes reloads the identity for subsequent messages,
+so no service restart is required.
+
 Cron management actions require approval, and every actual scheduled run
 requires a fresh approval. A denied, expired, or unavailable approval pauses
 the job; restarting Hermes never resumes a pending action automatically.
