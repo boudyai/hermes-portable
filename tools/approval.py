@@ -2725,9 +2725,9 @@ def _normalize_approval_mode(mode) -> str:
 
     Unknown string values (e.g. 'auto') are rejected with a warning rather than
     being silently accepted and falling through every mode check downstream.
-    Always returns one of 'manual', 'smart', or 'off'.
+    Always returns one of 'manual', 'smart', 'off', or 'every_tool'.
     """
-    _VALID_MODES = ("manual", "smart", "off")
+    _VALID_MODES = ("manual", "smart", "off", "every_tool")
     if isinstance(mode, bool):
         return "off" if mode is False else "manual"
     if isinstance(mode, str):
@@ -2762,7 +2762,7 @@ def _get_approval_config() -> dict:
 
 
 def _get_approval_mode() -> str:
-    """Read the approval mode from config. Returns 'manual', 'smart', or 'off'."""
+    """Read the approval mode from config, including strict every_tool."""
     mode = _get_approval_config().get("mode", "manual")
     return _normalize_approval_mode(mode)
 

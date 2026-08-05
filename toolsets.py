@@ -30,7 +30,7 @@ from typing import List, Dict, Any, Set, Optional
 # Edit this once to update all platforms simultaneously.
 _HERMES_CORE_TOOLS = [
     # Web
-    "web_search", "web_extract",
+    "web_search", "web_extract", "http_request",
     # Terminal + process management
     "terminal", "process",
     # Desktop GUI affordances: read the embedded terminal pane, close an agent's
@@ -40,6 +40,8 @@ _HERMES_CORE_TOOLS = [
     "read_terminal", "close_terminal", "open_preview", "focus_pane", "react_to_message",
     # File manipulation
     "read_file", "write_file", "patch", "search_files",
+    # Operator wiki (infrastructure inventory, runbooks, incidents, decisions)
+    "wiki_read", "wiki_write",
     # Vision + image generation
     "vision_analyze", "image_generate",
     # BFL FLUX 3 video generation
@@ -84,6 +86,29 @@ _HERMES_CORE_TOOLS = [
     # Computer use (macOS, gated on cua-driver being installed via check_fn)
     "computer_use",
 ]
+
+# The default profile is for infrastructure/operator work. Keep the broad
+# legacy ``hermes-cli`` composite intact for compatibility, but do not make
+# media generation, speech, or message-reaction capabilities part of the
+# default ops surface. New operational tools added to the core list flow into
+# ops unless they are explicitly classified as non-ops here.
+_OPS_EXCLUDED_TOOLS = frozenset({
+    # Subagents and desktop control are intentionally opt-in. The default
+    # server-ops profile must not create child agents or control a desktop.
+    "delegate_task",
+    "computer_use",
+    "react_to_message",
+    "vision_analyze",
+    "image_generate",
+    "bfl_flux3_text_to_video",
+    "bfl_flux3_image_to_video",
+    "bfl_flux3_keyframes_to_video",
+    "bfl_flux3_video_continuation",
+    "bfl_flux3_get_result",
+    "bfl_flux3_prompting_guide",
+    "text_to_speech",
+})
+_OPS_TOOLS = [tool for tool in _HERMES_CORE_TOOLS if tool not in _OPS_EXCLUDED_TOOLS]
 
 # Webhook events may originate from untrusted third-party content (for example,
 # public PR titles/comments). Keep the default webhook toolset intentionally
@@ -219,6 +244,12 @@ TOOLSETS = {
         "description": "File manipulation tools: read, write, patch (with fuzzy matching), and search (content + files)",
         "tools": ["read_file", "write_file", "patch", "search_files"],
         "includes": []
+    },
+
+    "wiki": {
+        "description": "Operator wiki read/write tools for infrastructure knowledge",
+        "tools": ["wiki_read", "wiki_write"],
+        "includes": [],
     },
     
     "tts": {
@@ -463,6 +494,17 @@ TOOLSETS = {
         "description": "Full interactive CLI toolset - all default tools plus cronjob management",
         "tools": _HERMES_CORE_TOOLS,
         "includes": []
+    },
+
+    "ops": {
+        "description": (
+            "Safe operations profile: terminal, files, code, browser, HTTP/web, "
+            "skills, memory, session search, cron, MCP and wiki. Delegation, "
+            "desktop control, messaging, and media generation are opt-in. "
+            "Pair with approvals.mode=every_tool."
+        ),
+        "tools": _OPS_TOOLS,
+        "includes": [],
     },
 
     "hermes-cron": {

@@ -783,7 +783,14 @@ def _sort_skills(skills: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return sorted(skills, key=lambda s: (s.get("category") or "", s["name"]))
 
 
-def skills_list(category: str = None, task_id: str = None) -> str:
+def skills_list(
+    category: str = None,
+    task_id: str = None,
+    *,
+    _approval_args: Dict[str, Any] | None = None,
+    _tool_call_id: str | None = None,
+    _session_id: str | None = None,
+) -> str:
     """
     List all available skills (progressive disclosure tier 1 - minimal metadata).
 
@@ -797,6 +804,26 @@ def skills_list(category: str = None, task_id: str = None) -> str:
     Returns:
         JSON string with minimal skill info: name, description, category
     """
+    approval_args = (
+        dict(_approval_args)
+        if isinstance(_approval_args, dict)
+        else ({"category": category} if category is not None else {})
+    )
+    try:
+        from tools.strict_approval import ensure_handler_approval
+
+        ensure_handler_approval(
+            "skills_list",
+            approval_args,
+            tool_call_id=str(_tool_call_id or ""),
+            session_id=str(_session_id or ""),
+            conversation_id=str(_session_id or task_id or ""),
+        )
+    except Exception:
+        return tool_error(
+            "Global approval blocked: security subsystem unavailable or call not approved",
+            success=False,
+        )
     try:
         active_skills_dir = _skills_dir()
         if not active_skills_dir.exists():
@@ -964,6 +991,10 @@ def skill_view(
     file_path: str = None,
     task_id: str = None,
     preprocess: bool = True,
+    *,
+    _approval_args: Dict[str, Any] | None = None,
+    _tool_call_id: str | None = None,
+    _session_id: str | None = None,
 ) -> str:
     """
     View the content of a skill or a specific file within a skill directory.
@@ -980,6 +1011,31 @@ def skill_view(
     Returns:
         JSON string with skill content or error message
     """
+    if isinstance(_approval_args, dict):
+        approval_args = dict(_approval_args)
+    else:
+        approval_args = {"name": name}
+        if file_path is not None:
+            approval_args["file_path"] = file_path
+        # ``preprocess`` is an internal direct-call option and is included
+        # when there is no dispatcher payload to make the direct path exact.
+        if preprocess is not True:
+            approval_args["preprocess"] = preprocess
+    try:
+        from tools.strict_approval import ensure_handler_approval
+
+        ensure_handler_approval(
+            "skill_view",
+            approval_args,
+            tool_call_id=str(_tool_call_id or ""),
+            session_id=str(_session_id or ""),
+            conversation_id=str(_session_id or task_id or ""),
+        )
+    except Exception:
+        return tool_error(
+            "Global approval blocked: security subsystem unavailable or call not approved",
+            success=False,
+        )
     try:
         # Validate before the ':' qualified-name dispatch so a Windows drive
         # path (e.g. C:\skills\foo) can't be reinterpreted as a plugin
@@ -1795,7 +1851,11 @@ registry.register(
     toolset="skills",
     schema=SKILLS_LIST_SCHEMA,
     handler=lambda args, **kw: skills_list(
-        category=args.get("category"), task_id=kw.get("task_id")
+        category=args.get("category"),
+        task_id=kw.get("task_id"),
+        _approval_args=dict(args) if isinstance(args, dict) else {},
+        _tool_call_id=kw.get("tool_call_id"),
+        _session_id=kw.get("session_id"),
     ),
     check_fn=check_skills_requirements,
     emoji="📚",
@@ -1914,6 +1974,38 @@ def _skill_view_with_bump(args, **kw):
     telemetry failure never breaks the tool call."""
     name = args.get("name", "")
     task_id = kw.get("task_id")
+    approval_args = dict(args) if isinstance(args, dict) else {}
+    strict_execution_token = None
+    try:
+        # The dedup fast path stats the skill file before calling skill_view.
+        # Establish the exact handler scope first so even a cache hit remains
+        # a real every_tool approval, including direct Python callers.
+        from tools.strict_approval import (
+            begin_authorized_execution,
+            ensure_handler_approval,
+            reset_authorized_execution,
+            strict_mode_enabled,
+        )
+
+        ensure_handler_approval(
+            "skill_view",
+            approval_args,
+            tool_call_id=str(kw.get("tool_call_id") or ""),
+            session_id=str(kw.get("session_id") or ""),
+            conversation_id=str(kw.get("session_id") or task_id or ""),
+        )
+        if strict_mode_enabled():
+            strict_execution_token = begin_authorized_execution(
+                "skill_view",
+                approval_args,
+                tool_call_id=str(kw.get("tool_call_id") or ""),
+            )
+    except Exception:
+        return tool_error(
+            "Global approval blocked: security subsystem unavailable or call not approved",
+            success=False,
+        )
+    result = tool_error("skill_view failed", success=False)
     # ── Repeat-view dedup ────────────────────────────────────────────
     # Mirrors read_file's unchanged-stub: when this session already
     # loaded the SAME skill file and it hasn't changed on disk, return a
@@ -1924,13 +2016,18 @@ def _skill_view_with_bump(args, **kw):
     # "skills must be loaded fully" rule is preserved — and the cache is
     # cleared on context compression (same hook as read_file's dedup)
     # so a post-compression re-view returns full content again.
-    stub = _check_skill_view_dedup(task_id, name, args.get("file_path"))
-    if stub is not None:
-        return stub
-    result = skill_view(
-        name, file_path=args.get("file_path"), task_id=task_id
-    )
     try:
+        stub = _check_skill_view_dedup(task_id, name, args.get("file_path"))
+        if stub is not None:
+            return stub
+        result = skill_view(
+            name,
+            file_path=args.get("file_path"),
+            task_id=task_id,
+            _approval_args=approval_args,
+            _tool_call_id=kw.get("tool_call_id"),
+            _session_id=kw.get("session_id"),
+        )
         parsed = json.loads(result)
         if isinstance(parsed, dict) and parsed.get("success"):
             _record_skill_view(task_id, name, args.get("file_path"), parsed)
@@ -1946,6 +2043,12 @@ def _skill_view_with_bump(args, **kw):
                 bump_use(str(resolved))
     except Exception:
         pass
+    finally:
+        if strict_execution_token is not None:
+            try:
+                reset_authorized_execution(strict_execution_token)
+            except Exception:
+                logger.error("Failed to reset strict skill_view scope", exc_info=True)
     return result
 
 

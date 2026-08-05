@@ -289,7 +289,12 @@ def _build_skill_message(
         content = _substitute_template_vars(content, skill_dir, session_id)
     if skills_cfg.get("inline_shell", False):
         timeout = int(skills_cfg.get("inline_shell_timeout", 10) or 10)
-        content = _expand_inline_shell(content, skill_dir, timeout)
+        content = _expand_inline_shell(
+            content,
+            skill_dir,
+            timeout,
+            session_id=session_id,
+        )
 
     parts = [activation_note, "", content.strip()]
 

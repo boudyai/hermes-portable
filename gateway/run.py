@@ -5027,6 +5027,10 @@ class TurnRunner:
             set_current_session_key,
             unregister_gateway_notify,
         )
+        from tools.strict_approval import (
+            register_notifier as register_strict_approval_notifier,
+            unregister_notifier as unregister_strict_approval_notifier,
+        )
 
         def _approval_notify_sync(approval_data: dict) -> None:
             """Send the approval request to the user from the agent thread.
@@ -5118,6 +5122,36 @@ class TurnRunner:
                     _approval_send_fut.result(timeout=15)
             except Exception as _e:
                 logger.error("Failed to send approval request: %s", _e)
+
+        def _strict_approval_notify_sync(approval_data: dict) -> None:
+            """Send the strict every-tool prompt with exactly two buttons.
+
+            There is intentionally no text fallback here: if Telegram cannot
+            render/send this prompt, the strict gate fails closed and the tool
+            is not executed.
+            """
+            adapter = ctx._status_adapter
+            sender = getattr(type(adapter), "send_strict_tool_approval", None)
+            if sender is None:
+                raise RuntimeError("Telegram strict approval UI is unavailable")
+            try:
+                ctx._status_adapter.pause_typing_for_chat(ctx._status_chat_id)
+            except Exception:
+                pass
+            fut = safe_schedule_threadsafe(
+                adapter.send_strict_tool_approval(
+                    approval=approval_data,
+                    metadata=ctx._status_thread_metadata,
+                ),
+                ctx._loop_for_step,
+                logger=logger,
+                log_message="strict approval scheduling error",
+            )
+            if fut is None:
+                raise RuntimeError("Telegram event loop is unavailable")
+            response = fut.result(timeout=15)
+            if not getattr(response, "success", False):
+                raise RuntimeError(getattr(response, "error", None) or "Telegram send failed")
 
         # Keep real user text separate from API-only recovery guidance.  If
         # an auto-continue note is prepended below, persist the original
@@ -5265,6 +5299,21 @@ class TurnRunner:
         _approval_session_key = ctx.session_key or ""
         _approval_session_token = set_current_session_key(_approval_session_key)
         register_gateway_notify(_approval_session_key, _approval_notify_sync)
+        _strict_notifier_registered = False
+        if (
+            _approval_session_key
+            and str(getattr(ctx.source, "user_id", "") or "")
+            and str(ctx._status_chat_id or "")
+            and getattr(type(ctx._status_adapter), "send_strict_tool_approval", None) is not None
+            and getattr(ctx.source, "platform", None) == Platform.TELEGRAM
+        ):
+            register_strict_approval_notifier(
+                _approval_session_key,
+                _strict_approval_notify_sync,
+                telegram_user_id=str(getattr(ctx.source, "user_id", "") or ""),
+                telegram_chat_id=str(ctx._status_chat_id or ""),
+            )
+            _strict_notifier_registered = True
         try:
             # If _prepare_inbound_message_text buffered image paths for native
             # attachment, wrap the user turn as an OpenAI-style multimodal
@@ -5316,6 +5365,8 @@ class TurnRunner:
             result = agent.run_conversation(_api_run_message, **_conversation_kwargs)
         finally:
             unregister_gateway_notify(_approval_session_key)
+            if _strict_notifier_registered:
+                unregister_strict_approval_notifier(_approval_session_key)
             # Cancel any pending clarify entries so blocked agent
             # threads don't hang past the end of the run (interrupt,
             # completion, gateway shutdown).  Idempotent.

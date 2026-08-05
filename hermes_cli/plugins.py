@@ -2278,6 +2278,18 @@ def resolve_pre_tool_block(
     if details.action == "block":
         return details.message
     if details.action == "approve":
+        # In strict global HITL mode the caller has already obtained the
+        # canonical Telegram approval before reaching this hook.  Do not open
+        # the legacy dangerous-command/smart approval UI a second time; the
+        # plugin may still return ``block`` above, but an ``approve`` directive
+        # cannot become an alternate authorization path.
+        try:
+            from tools.strict_approval import strict_mode_enabled
+
+            if strict_mode_enabled():
+                return None
+        except Exception:
+            return f"BLOCKED: global approval subsystem unavailable for {tool_name}"
         try:
             from tools.approval import (
                 request_tool_approval,

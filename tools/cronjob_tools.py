@@ -278,6 +278,19 @@ def _scan_cron_prompt(prompt: str) -> str:
     return ""
 
 
+def _legacy_cron_prompt_scan_if_needed(prompt: str) -> str:
+    """Keep prompt threat scanning out of strict approval decisions."""
+
+    try:
+        from tools.strict_approval import strict_mode_enabled
+
+        if strict_mode_enabled():
+            return ""
+    except Exception:
+        return "Global approval blocked: security subsystem unavailable"
+    return _scan_cron_prompt(prompt)
+
+
 def _scan_cron_skill_assembled(assembled: str) -> tuple[str, str]:
     """Scan an ASSEMBLED cron prompt that includes loaded skill content.
 
@@ -606,8 +619,35 @@ def _execute_job_now(job: Dict[str, Any]) -> Dict[str, Any]:
     Returns {"claimed": bool, "success": bool, "error": str|None}.
     """
     job_id = job["id"]
+    strict_cleanup = None
+    cleanup_handed_off = False
     try:
-        from cron.scheduler import run_one_job
+        from cron.scheduler import (
+            _cleanup_strict_cron_run,
+            _prepare_strict_cron_run_approval,
+            _strict_cron_approval_matches_job,
+            run_one_job,
+        )
+
+        # Obtain the fresh scheduled-run approval before claiming or
+        # advancing scheduler state.  Only the opaque cleanup handle returned by this
+        # trusted helper is passed into run_one_job; an absent value is never
+        # treated as proof and the shared runner will perform its own check.
+        strict_cleanup = _prepare_strict_cron_run_approval(job)
+        if strict_cleanup is False:
+            return {
+                "claimed": False,
+                "success": False,
+                "error": "Scheduled run paused pending Telegram approval.",
+            }
+        if strict_cleanup is not None and not _strict_cron_approval_matches_job(
+            strict_cleanup, job
+        ):
+            return {
+                "claimed": False,
+                "success": False,
+                "error": "Scheduled run blocked: job changed after Telegram approval.",
+            }
 
         # At-most-once claim: bail without running if a tick/other fire owns it.
         if not claim_job_for_fire(job_id):
@@ -685,7 +725,11 @@ def _execute_job_now(job: Dict[str, Any]) -> Dict[str, Any]:
             _heartbeat_thread.start()
 
         try:
-            processed = run_one_job(job)
+            # Mark ownership before entering the shared runner: it releases
+            # the trusted cleanup tuple in its own finally block, including
+            # when the run raises.
+            cleanup_handed_off = True
+            processed = run_one_job(job, _strict_cron_cleanup=strict_cleanup)
         finally:
             _heartbeat_stop.set()
             if _heartbeat_thread is not None:
@@ -705,6 +749,18 @@ def _execute_job_now(job: Dict[str, Any]) -> Dict[str, Any]:
         except Exception:
             pass
         return {"claimed": True, "success": False, "error": str(e)}
+    finally:
+        if not cleanup_handed_off:
+            try:
+                from cron.scheduler import _cleanup_strict_cron_run
+
+                _cleanup_strict_cron_run(strict_cleanup)
+            except Exception:
+                logger.error(
+                    "Failed to release strict cron approval for job %s",
+                    job_id,
+                    exc_info=True,
+                )
 
 
 def cronjob(
@@ -729,9 +785,55 @@ def cronjob(
     no_agent: Optional[bool] = None,
     attach_to_session: Optional[bool] = None,
     task_id: str = None,
+    *,
+    _approval_args: Optional[Dict[str, Any]] = None,
+    _tool_call_id: Optional[str] = None,
+    _session_id: Optional[str] = None,
 ) -> str:
     """Unified cron job management tool."""
     del task_id  # unused but kept for handler signature compatibility
+
+    approval_args = (
+        dict(_approval_args)
+        if isinstance(_approval_args, dict)
+        else {
+            "action": action,
+            "job_id": job_id,
+            "prompt": prompt,
+            "schedule": schedule,
+            "name": name,
+            "repeat": repeat,
+            "deliver": deliver,
+            "model": model,
+            "provider": provider,
+            "base_url": base_url,
+            "include_disabled": include_disabled,
+            "skill": skill,
+            "skills": skills,
+            "reason": reason,
+            "script": script,
+            "context_from": context_from,
+            "enabled_toolsets": enabled_toolsets,
+            "workdir": workdir,
+            "no_agent": no_agent,
+            "attach_to_session": attach_to_session,
+        }
+    )
+    try:
+        from tools.strict_approval import ensure_handler_approval
+
+        ensure_handler_approval(
+            "cronjob",
+            approval_args,
+            tool_call_id=str(_tool_call_id or ""),
+            session_id=str(_session_id or ""),
+            conversation_id=str(_session_id or ""),
+        )
+    except Exception:
+        return tool_error(
+            "Global approval blocked: security subsystem unavailable or call not approved",
+            success=False,
+        )
 
     try:
         normalized = (action or "").strip().lower()
@@ -756,7 +858,7 @@ def cronjob(
             elif not prompt and not canonical_skills:
                 return tool_error("create requires either prompt or at least one skill", success=False)
             if prompt:
-                scan_error = _scan_cron_prompt(prompt)
+                scan_error = _legacy_cron_prompt_scan_if_needed(prompt)
                 if scan_error:
                     return tool_error(scan_error, success=False)
 
@@ -914,7 +1016,7 @@ def cronjob(
         if normalized == "update":
             updates: Dict[str, Any] = {}
             if prompt is not None:
-                scan_error = _scan_cron_prompt(prompt)
+                scan_error = _legacy_cron_prompt_scan_if_needed(prompt)
                 if scan_error:
                     return tool_error(scan_error, success=False)
                 updates["prompt"] = prompt
@@ -1185,6 +1287,9 @@ registry.register(
         workdir=args.get("workdir"),
         no_agent=args.get("no_agent"),
         task_id=kw.get("task_id"),
+        _approval_args=dict(args) if isinstance(args, dict) else {},
+        _tool_call_id=kw.get("tool_call_id"),
+        _session_id=kw.get("session_id"),
     ),
     check_fn=check_cronjob_requirements,
     emoji="⏰",

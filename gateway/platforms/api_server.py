@@ -5418,6 +5418,36 @@ class APIServerAdapter(BasePlatformAdapter):
             )
         return None
 
+    @staticmethod
+    def _strict_cron_mutation_block() -> Optional["web.Response"]:
+        """Block non-Telegram cron mutations in the global every-tool mode.
+
+        The authenticated REST API is a control plane, not a Telegram tool
+        dispatcher. Letting it create, alter, delete, or fire jobs would create
+        an unattended background execution path with no exact Telegram
+        approval payload. Read-only job inspection remains available; all
+        mutation/run endpoints fail closed until a Telegram-approved
+        ``cronjob`` call owns the operation.
+        """
+        try:
+            from tools.strict_approval import strict_mode_enabled
+
+            if not strict_mode_enabled():
+                return None
+        except Exception:
+            return web.json_response(
+                {"error": "every_tool approval subsystem unavailable"}, status=503
+            )
+        return web.json_response(
+            {
+                "error": (
+                    "cron mutation is blocked in approvals.mode=every_tool; "
+                    "use the Telegram-approved cronjob tool"
+                )
+            },
+            status=403,
+        )
+
     def _check_job_id(self, request: "web.Request") -> tuple:
         """Validate and extract job_id. Returns (job_id, error_response)."""
         job_id = request.match_info["job_id"]
@@ -5455,6 +5485,9 @@ class APIServerAdapter(BasePlatformAdapter):
         cron_err = self._check_jobs_available()
         if cron_err:
             return cron_err
+        strict_err = self._strict_cron_mutation_block()
+        if strict_err:
+            return strict_err
         try:
             body = await request.json()
             name = (body.get("name") or "").strip()
@@ -5528,6 +5561,9 @@ class APIServerAdapter(BasePlatformAdapter):
         cron_err = self._check_jobs_available()
         if cron_err:
             return cron_err
+        strict_err = self._strict_cron_mutation_block()
+        if strict_err:
+            return strict_err
         job_id, id_err = self._check_job_id(request)
         if id_err:
             return id_err
@@ -5566,6 +5602,9 @@ class APIServerAdapter(BasePlatformAdapter):
         cron_err = self._check_jobs_available()
         if cron_err:
             return cron_err
+        strict_err = self._strict_cron_mutation_block()
+        if strict_err:
+            return strict_err
         job_id, id_err = self._check_job_id(request)
         if id_err:
             return id_err
@@ -5586,6 +5625,9 @@ class APIServerAdapter(BasePlatformAdapter):
         cron_err = self._check_jobs_available()
         if cron_err:
             return cron_err
+        strict_err = self._strict_cron_mutation_block()
+        if strict_err:
+            return strict_err
         job_id, id_err = self._check_job_id(request)
         if id_err:
             return id_err
@@ -5606,6 +5648,9 @@ class APIServerAdapter(BasePlatformAdapter):
         cron_err = self._check_jobs_available()
         if cron_err:
             return cron_err
+        strict_err = self._strict_cron_mutation_block()
+        if strict_err:
+            return strict_err
         job_id, id_err = self._check_job_id(request)
         if id_err:
             return id_err
@@ -5629,6 +5674,9 @@ class APIServerAdapter(BasePlatformAdapter):
         cron_err = self._check_jobs_available()
         if cron_err:
             return cron_err
+        strict_err = self._strict_cron_mutation_block()
+        if strict_err:
+            return strict_err
         job_id, id_err = self._check_job_id(request)
         if id_err:
             return id_err
@@ -5652,6 +5700,10 @@ class APIServerAdapter(BasePlatformAdapter):
         trips NAS's HTTP timeout. The store CAS claim inside fire_due guards
         against double-fire on a NAS/scheduler retry.
         """
+        strict_err = self._strict_cron_mutation_block()
+        if strict_err:
+            return strict_err
+
         from hermes_cli.config import cfg_get, load_config
         from plugins.cron_providers.chronos.verify import get_fire_verifier
 
@@ -5707,8 +5759,14 @@ class APIServerAdapter(BasePlatformAdapter):
             loop = asyncio.get_running_loop()
             # Fire in the background (202 immediately). fire_due claims via the
             # store CAS, so a retry while this is in flight is de-duped.
+            live_adapters = getattr(self.gateway_runner, "adapters", None)
             task = asyncio.create_task(
-                asyncio.to_thread(provider.fire_due, job_id, adapters=None, loop=loop)
+                asyncio.to_thread(
+                    provider.fire_due,
+                    job_id,
+                    adapters=live_adapters,
+                    loop=loop,
+                )
             )
             reservation["detached"] = True
             task.add_done_callback(

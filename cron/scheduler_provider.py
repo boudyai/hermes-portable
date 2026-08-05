@@ -102,15 +102,52 @@ class CronScheduler(ABC):
         """
         from cron.jobs import claim_job_for_fire, get_job
         from cron.executions import create_execution
-        from cron.scheduler import run_one_job
+        from cron.scheduler import (
+            _cleanup_strict_cron_run,
+            _prepare_strict_cron_run_approval,
+            _strict_cron_approval_matches_job,
+            run_one_job,
+        )
 
-        if not claim_job_for_fire(job_id):
-            return False  # another machine already claimed this fire
-        job = get_job(job_id)
-        if job is None:
-            return False  # job removed (e.g. repeat-N exhausted) between arm and fire
-        job["execution_id"] = create_execution(job_id, source=self.name)["id"]
-        return run_one_job(job, adapters=adapters, loop=loop)
+        # External fire webhooks are another scheduled-run dispatcher. Obtain
+        # the fresh Telegram decision before claim/execution bookkeeping, so a
+        # denied or unavailable approval cannot create an execution record or
+        # consume the provider's fire claim.
+        strict_cleanup = None
+        cleanup_handed_off = False
+        try:
+            strict_cleanup = _prepare_strict_cron_run_approval(
+                get_job(job_id) or {"id": job_id},
+                adapters=adapters,
+                loop=loop,
+            )
+            if strict_cleanup is False:
+                return False
+            job = get_job(job_id)
+            if job is None:
+                return False
+            if strict_cleanup is not None and not _strict_cron_approval_matches_job(
+                strict_cleanup, job
+            ):
+                return False
+
+            if not claim_job_for_fire(job_id):
+                return False  # another machine already claimed this fire
+            job = get_job(job_id)
+            if job is None:
+                return False  # job removed (e.g. repeat-N exhausted) between arm and fire
+            job["execution_id"] = create_execution(job_id, source=self.name)["id"]
+            # run_one_job owns cleanup from this point, including exceptions.
+            cleanup_handed_off = True
+            return run_one_job(
+                job,
+                adapters=adapters,
+                loop=loop,
+                _strict_cron_cleanup=strict_cleanup,
+            )
+        finally:
+            if not cleanup_handed_off:
+                _cleanup_strict_cron_run(strict_cleanup)
 
     def reconcile(self) -> None:
         """Converge the external registry toward jobs.json (the desired state):

@@ -21,6 +21,7 @@ import subprocess
 import sys
 import threading
 import time
+import uuid
 
 # fcntl is Unix-only; on Windows use msvcrt for file locking
 try:
@@ -51,6 +52,26 @@ from hermes_time import now as _hermes_now
 from agent.interrupt_compat import request_hard_interrupt
 
 logger = logging.getLogger(__name__)
+
+# A scheduled run receives a synthetic approval in ``run_one_job`` before it
+# enters ``run_job``.  Keep that authorization scoped to the current worker
+# context so a direct caller of the lower-level ``run_job`` sink cannot execute
+# a no-agent script or an LLM job without going through the scheduler gate.
+_strict_cron_run_authorized = contextvars.ContextVar(
+    "strict_cron_run_authorized", default=None
+)
+
+
+def _consume_strict_cron_run_authorization(job_id: str) -> bool:
+    """Consume the one-shot capability for the low-level cron sink."""
+    from tools.strict_approval import strict_mode_enabled
+
+    if not strict_mode_enabled():
+        return True
+    if _strict_cron_run_authorized.get() != str(job_id):
+        return False
+    _strict_cron_run_authorized.set(None)
+    return True
 
 
 def _set_cron_session_title(session_db, session_id, base_title):
@@ -282,7 +303,15 @@ _LEGACY_HOME_TARGET_ENV_VARS = {
     "QQBOT_HOME_CHANNEL": "QQ_HOME_CHANNEL",
 }
 
-from cron.jobs import get_due_jobs, mark_job_run, save_job_output, advance_next_runs, claim_dispatch, heartbeat_run_claim
+from cron.jobs import (
+    get_due_jobs,
+    mark_job_run,
+    save_job_output,
+    advance_next_runs,
+    claim_dispatch,
+    heartbeat_run_claim,
+    pause_job,
+)
 from cron.executions import create_execution, finish_execution, mark_execution_running
 
 # Sentinel: when a cron agent has nothing new to report, it can start its
@@ -2688,6 +2717,19 @@ def _scan_assembled_cron_prompt(
     create/update-time guarantee at runtime (defense-in-depth for legacy
     jobs that predate the create-time scanner).
     """
+    try:
+        from tools.strict_approval import strict_mode_enabled
+
+        if strict_mode_enabled():
+            # The complete scheduled-run payload has already received a fresh
+            # Telegram approval. Do not apply the legacy regex/prompt-policy
+            # decision as a second approval gate.
+            return assembled
+    except Exception as exc:
+        raise CronPromptInjectionBlocked(
+            "Global approval blocked: security subsystem unavailable"
+        ) from exc
+
     from tools.cronjob_tools import _scan_cron_prompt, _scan_cron_skill_assembled
 
     if has_skills or has_injected_data:
@@ -2782,6 +2824,22 @@ def run_job(
     """
     job_id = job["id"]
     job_name = str(job.get("name") or job.get("prompt") or job_id or "cron job")
+
+    # ``run_job`` is also imported directly by CLI/API/tests, so the outer
+    # ``run_one_job`` gate cannot be the only boundary.  A direct call has no
+    # safe way to bind a Telegram chat here; block it before the first script,
+    # file, provider, or agent side effect.  The normal scheduled path sets
+    # the context marker only after its fresh Telegram approval.
+    try:
+        from tools.strict_approval import strict_mode_enabled
+
+        if not _consume_strict_cron_run_authorization(job_id):
+            message = "Scheduled run blocked: fresh Telegram approval is required."
+            logger.warning("Job '%s' blocked before direct cron execution", job_id)
+            return False, "", "", message
+    except Exception as strict_error:
+        logger.error("Job '%s' blocked by cron approval subsystem: %s", job_id, strict_error)
+        return False, "", "", "Scheduled run blocked: approval subsystem unavailable."
 
     # ---------------------------------------------------------------
     # no_agent short-circuit — the script IS the job, no LLM involvement.
@@ -3889,7 +3947,296 @@ def _teardown_cron_agent(agent, job_id: str) -> None:
         logger.debug("Job '%s': failed to reap stale auxiliary clients: %s", job_id, e)
 
 
-def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -> bool:
+def _pause_strict_cron_job(job: dict, reason: str) -> None:
+    """Pause a blocked strict run and release only this run's scheduler claims."""
+    pause_job(job["id"], reason=reason)
+    try:
+        # ``pause_job`` intentionally preserves legacy claim fields.  A strict
+        # approval timeout/deny happens before execution, so retaining those
+        # fields would make a later explicit resume look like a duplicate fire
+        # until the claim TTL elapsed.
+        from cron.jobs import update_job
+
+        update_job(job["id"], {"fire_claim": None, "run_claim": None})
+    except Exception:
+        logger.error(
+            "Job '%s' was paused but its strict-run claim could not be cleared",
+            job.get("id"),
+            exc_info=True,
+        )
+
+
+class _StrictCronCleanup:
+    """Opaque in-process handoff for a fresh scheduled-run approval."""
+
+    __slots__ = (
+        "_capability",
+        "session_key",
+        "context_token",
+        "cron_authorization_token",
+        "unregister_notifier",
+        "reset_current_session_key",
+        "approved_job_hash",
+    )
+
+    def __init__(
+        self,
+        session_key,
+        context_token,
+        cron_authorization_token,
+        unregister_notifier,
+        reset_current_session_key,
+        approved_job_hash,
+        *,
+        capability,
+    ):
+        if capability is not _STRICT_CRON_CLEANUP_CAPABILITY:
+            raise RuntimeError("invalid strict cron cleanup capability")
+        self._capability = capability
+        self.session_key = session_key
+        self.context_token = context_token
+        self.cron_authorization_token = cron_authorization_token
+        self.unregister_notifier = unregister_notifier
+        self.reset_current_session_key = reset_current_session_key
+        self.approved_job_hash = approved_job_hash
+
+    def is_valid(self) -> bool:
+        return self._capability is _STRICT_CRON_CLEANUP_CAPABILITY
+
+
+_STRICT_CRON_CLEANUP_UNSET = object()
+_STRICT_CRON_CLEANUP_CAPABILITY = object()
+
+
+def _cleanup_strict_cron_run(cleanup) -> None:
+    """Release the temporary Telegram binding and scheduled-run proof."""
+    if not isinstance(cleanup, _StrictCronCleanup) or not cleanup.is_valid():
+        return
+    try:
+        cleanup.reset_current_session_key(cleanup.context_token)
+    finally:
+        try:
+            _strict_cron_run_authorized.reset(cleanup.cron_authorization_token)
+        finally:
+            cleanup.unregister_notifier(cleanup.session_key)
+
+
+def _strict_cron_job_snapshot(job: dict) -> dict:
+    """Return the JSON-safe job definition bound to a scheduled approval."""
+    keys = (
+        "id", "name", "prompt", "schedule", "schedule_display", "repeat",
+        "deliver", "origin", "skills", "skill", "model", "provider",
+        "base_url", "script", "context_from", "enabled_toolsets", "workdir",
+        "no_agent", "attach_to_session",
+    )
+    snapshot = {}
+    for key in keys:
+        value = job.get(key)
+        try:
+            json.dumps(value, ensure_ascii=False, allow_nan=False)
+        except (TypeError, ValueError):
+            value = str(value)
+        snapshot[key] = value
+    return snapshot
+
+
+def _strict_cron_approval_args(job: dict) -> dict:
+    """Build the immutable Telegram payload for one scheduled execution."""
+    from tools.strict_approval import arguments_hash, canonical_json
+
+    snapshot = _strict_cron_job_snapshot(job)
+    return {
+        "job_id": str(job["id"]),
+        "name": str(job.get("name") or job["id"]),
+        "scheduled_at": time.time(),
+        "job": snapshot,
+        "job_hash": arguments_hash(
+            "cron.scheduled_run", canonical_json(snapshot)
+        ),
+    }
+
+
+def _strict_cron_approval_matches_job(cleanup, job: dict) -> bool:
+    """Check that the approved scheduled definition is still the one to run."""
+    if not isinstance(cleanup, _StrictCronCleanup) or not cleanup.is_valid():
+        return False
+    try:
+        from tools.strict_approval import arguments_hash, canonical_json
+
+        snapshot = _strict_cron_job_snapshot(job)
+        expected = arguments_hash(
+            "cron.scheduled_run", canonical_json(snapshot)
+        )
+    except Exception:
+        return False
+    return bool(cleanup.approved_job_hash) and cleanup.approved_job_hash == expected
+
+
+def _prepare_strict_cron_run_approval(job: dict, adapters=None, loop=None):
+    """Require a fresh Telegram approval before any scheduled side effect.
+
+    The returned opaque cleanup handle is kept alive for the whole
+    run so tool calls emitted by the cron agent use the same Telegram binding
+    and still receive their own approvals. ``False`` means strict mode was
+    active but the run was paused/denied; ``None`` means legacy mode.
+    """
+    try:
+        from tools.strict_approval import (
+            clear_inherited_authorization_context,
+            register_notifier,
+            require_tool_approval,
+            strict_mode_enabled,
+            unregister_notifier,
+        )
+        from tools.approval import set_current_session_key, reset_current_session_key
+
+        if not strict_mode_enabled():
+            return None
+        # A manual ``cronjob(action='run')`` arrives here while its own
+        # one-use approval scope is still active.  The scheduled firing is a
+        # distinct operation and must not inherit that proof; it receives a
+        # fresh approval below before any claim, script, provider, or agent
+        # work starts.
+        clear_inherited_authorization_context()
+        if adapters is None:
+            # ``cronjob(action='run')`` is itself dispatched from an already
+            # bound Telegram turn and calls ``run_one_job`` without passing the
+            # gateway's adapter map. Reuse that live notifier for the fresh
+            # scheduled-run decision; never treat the parent tool approval as
+            # approval for the run.
+            from tools.approval import get_current_session_key
+
+            current_session_key = str(get_current_session_key(default="") or "")
+            if not current_session_key:
+                reason = "strict cron run has no bound Telegram session"
+                _pause_strict_cron_job(job, reason)
+                logger.warning("Job '%s' paused: %s", job.get("id"), reason)
+                return False
+            try:
+                approval_args = _strict_cron_approval_args(job)
+                invocation = require_tool_approval(
+                    "cron.scheduled_run",
+                    approval_args,
+                    tool_call_id=f"cron-run:{job['id']}:{uuid.uuid4().hex}",
+                    session_id=current_session_key,
+                    conversation_id=current_session_key,
+                )
+                approved_job_hash = str(
+                    (invocation.args if invocation is not None else {}).get("job_hash") or ""
+                )
+                if not approved_job_hash:
+                    raise RuntimeError("scheduled approval payload has no job hash")
+            except Exception as exc:
+                _pause_strict_cron_job(job, reason=f"approval denied or unavailable: {exc}")
+                logger.warning("Job '%s' paused after strict approval failure: %s", job.get("id"), exc)
+                return False
+            cron_authorization_token = _strict_cron_run_authorized.set(str(job["id"]))
+            return _StrictCronCleanup(
+                current_session_key,
+                None,
+                cron_authorization_token,
+                lambda _session_key: None,
+                lambda _context_token: None,
+                approved_job_hash,
+                capability=_STRICT_CRON_CLEANUP_CAPABILITY,
+            )
+        origin = _resolve_origin(job) or {}
+        platform = str(origin.get("platform") or "").lower()
+        user_id = str(origin.get("user_id") or "")
+        chat_id = str(origin.get("chat_id") or "")
+        if platform != "telegram" or not user_id or not chat_id or not adapters:
+            reason = "every_tool scheduled run requires a live Telegram origin and user binding"
+            _pause_strict_cron_job(job, reason)
+            logger.warning("Job '%s' paused: %s", job.get("id"), reason)
+            return False
+
+        adapter = None
+        for key, candidate in (adapters or {}).items():
+            if str(getattr(key, "value", key)).lower() == "telegram":
+                adapter = candidate
+                break
+        sender = getattr(type(adapter), "send_strict_tool_approval", None) if adapter else None
+        if sender is None:
+            reason = "Telegram strict approval UI is unavailable"
+            _pause_strict_cron_job(job, reason)
+            logger.warning("Job '%s' paused: %s", job.get("id"), reason)
+            return False
+
+        session_key = f"cron:{job['id']}:{uuid.uuid4().hex}"
+
+        def notify(payload: dict) -> bool:
+            metadata = {"thread_id": origin.get("thread_id")}
+            coroutine = adapter.send_strict_tool_approval(
+                approval=payload,
+                metadata=metadata,
+            )
+            if loop is not None and loop.is_running():
+                response = asyncio.run_coroutine_threadsafe(coroutine, loop).result(timeout=15)
+            else:
+                response = asyncio.run(coroutine)
+            if not getattr(response, "success", False):
+                raise RuntimeError(getattr(response, "error", None) or "Telegram send failed")
+            return True
+
+        register_notifier(
+            session_key,
+            notify,
+            telegram_user_id=user_id,
+            telegram_chat_id=chat_id,
+        )
+        context_token = None
+        try:
+            context_token = set_current_session_key(session_key)
+            approval_args = _strict_cron_approval_args(job)
+            invocation = require_tool_approval(
+                "cron.scheduled_run",
+                approval_args,
+                tool_call_id=f"cron-run:{job['id']}:{uuid.uuid4().hex}",
+                session_id=session_key,
+                conversation_id=session_key,
+                telegram_user_id=user_id,
+                telegram_chat_id=chat_id,
+            )
+            approved_job_hash = str(
+                (invocation.args if invocation is not None else {}).get("job_hash") or ""
+            )
+            if not approved_job_hash:
+                raise RuntimeError("scheduled approval payload has no job hash")
+        except Exception as exc:
+            if context_token is not None:
+                reset_current_session_key(context_token)
+            unregister_notifier(session_key)
+            _pause_strict_cron_job(job, reason=f"approval denied or unavailable: {exc}")
+            logger.warning("Job '%s' paused after strict approval failure: %s", job.get("id"), exc)
+            return False
+        cron_authorization_token = _strict_cron_run_authorized.set(str(job["id"]))
+        return _StrictCronCleanup(
+            session_key,
+            context_token,
+            cron_authorization_token,
+            unregister_notifier,
+            reset_current_session_key,
+            approved_job_hash,
+            capability=_STRICT_CRON_CLEANUP_CAPABILITY,
+        )
+    except Exception as exc:
+        try:
+            _pause_strict_cron_job(job, reason=f"strict approval subsystem failure: {exc}")
+        except Exception:
+            pass
+        logger.error("Job '%s' blocked by strict approval subsystem: %s", job.get("id"), exc)
+        return False
+
+
+def run_one_job(
+    job: dict,
+    *,
+    adapters=None,
+    loop=None,
+    verbose: bool = False,
+    execution_source: str = "direct",
+    _strict_cron_cleanup=_STRICT_CRON_CLEANUP_UNSET,
+) -> bool:
     """Run ONE due job end-to-end: execute → save output → deliver → mark.
 
     This is the shared firing body extracted from ``tick``'s per-job closure so
@@ -3905,9 +4252,43 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
     failure is recorded via ``mark_job_run``), False only if processing raised.
     """
     execution_id = job.get("execution_id")
-    if not execution_id:
-        execution_id = create_execution(job["id"], source="direct")["id"]
+    if _strict_cron_cleanup is _STRICT_CRON_CLEANUP_UNSET:
+        _strict_cron_cleanup = None
+    elif (
+        not isinstance(_strict_cron_cleanup, _StrictCronCleanup)
+        or not _strict_cron_cleanup.is_valid()
+    ):
+        # Only the opaque object produced by the trusted preflight helper can
+        # suppress a second prompt.  Direct callers cannot smuggle a
+        # tuple/boolean into this private handoff to bypass approval.
+        _strict_cron_cleanup = None
     try:
+        if _strict_cron_cleanup is None:
+            _strict_cron_cleanup = _prepare_strict_cron_run_approval(job, adapters, loop)
+        if _strict_cron_cleanup is False:
+            if execution_id:
+                finish_execution(
+                    execution_id,
+                    success=False,
+                    error="Scheduled run paused pending Telegram approval.",
+                )
+            return True
+        if (
+            _strict_cron_cleanup is not None
+            and not _strict_cron_approval_matches_job(_strict_cron_cleanup, job)
+        ):
+            reason = "Scheduled run blocked: job changed after Telegram approval."
+            _pause_strict_cron_job(job, reason)
+            if execution_id:
+                finish_execution(execution_id, success=False, error=reason)
+            return True
+        # Persist the execution only after the fresh scheduled-run approval.
+        # This keeps even scheduler bookkeeping behind the fail-closed gate
+        # and prevents a denied run from looking like an execution in flight.
+        if not execution_id:
+            execution_id = create_execution(
+                job["id"], source=str(execution_source or "direct")
+            )["id"]
         # Pre-run dispatch claim (issue #38758): atomically commit a finite
         # one-shot's dispatch BEFORE its side effect runs, so a tick that dies
         # mid-execution (gateway kill, OOM, segfault, hard-timeout) cannot
@@ -4090,6 +4471,8 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
         if not isinstance(e, Exception):
             raise
         return False
+    finally:
+        _cleanup_strict_cron_run(_strict_cron_cleanup)
 
 
 def _notify_provider_jobs_changed() -> None:
@@ -4217,7 +4600,13 @@ def tick(
             module-level ``run_one_job`` so ``tick`` and external providers
             (Chronos ``fire_due``) use the identical execute→save→deliver→mark
             body."""
-            return run_one_job(job, adapters=adapters, loop=loop, verbose=verbose)
+            return run_one_job(
+                job,
+                adapters=adapters,
+                loop=loop,
+                verbose=verbose,
+                execution_source="builtin",
+            )
 
         # Partition due jobs: those with a per-job workdir mutate
         # os.environ["TERMINAL_CWD"] inside run_job, which is process-global, so
@@ -4255,10 +4644,32 @@ def tick(
                     logger.info("Job '%s' already running — skipping", job.get("name", job_id))
                     return None
                 _running_job_ids.add(job_id)
-            # Record the attempt before executor dispatch. Recovery classifies
-            # abandoned records as unknown; it never automatically retries them.
-            execution = create_execution(job_id, source="builtin")
-            dispatched_job = dict(job, execution_id=execution["id"])
+            # Do not create an execution record here in every_tool mode.  The
+            # worker must obtain the fresh scheduled-run approval first; the
+            # shared run_one_job() body creates the execution record only after
+            # that approval. Preserve the historical pre-dispatch ledger
+            # record in legacy modes. The in-flight set still prevents
+            # duplicate ticks while the Telegram decision is pending.
+            execution = None
+            _strict_scheduler_mode = True
+            try:
+                from tools.strict_approval import strict_mode_enabled
+
+                _strict_scheduler_mode = strict_mode_enabled()
+            except Exception as strict_error:
+                # A security-component failure must not turn into an
+                # unattended legacy execution. run_one_job() will fail closed
+                # again at its own boundary.
+                logger.error(
+                    "Job '%s' strict approval status unavailable: %s",
+                    job_id,
+                    strict_error,
+                )
+            if not _strict_scheduler_mode:
+                execution = create_execution(job_id, source="builtin")
+                dispatched_job = dict(job, execution_id=execution["id"])
+            else:
+                dispatched_job = dict(job)
             _ctx = contextvars.copy_context()
 
             def _run_and_release(j=dispatched_job, ctx=_ctx):
@@ -4273,11 +4684,12 @@ def tick(
             except Exception as submit_err:
                 with _running_lock:
                     _running_job_ids.discard(job_id)
-                finish_execution(
-                    execution["id"],
-                    success=False,
-                    error=f"Executor dispatch failed: {submit_err}",
-                )
+                if execution is not None:
+                    finish_execution(
+                        execution["id"],
+                        success=False,
+                        error=f"Executor dispatch failed: {submit_err}",
+                    )
                 # Interpreter began finalizing between the guard above and the
                 # submit — release the in-flight claim we just took and skip.
                 if isinstance(submit_err, RuntimeError) and _interpreter_shutting_down(submit_err):

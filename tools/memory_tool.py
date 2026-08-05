@@ -387,16 +387,25 @@ class MemoryStore:
             return self.user_char_limit
         return self.memory_char_limit
 
-    def add(self, target: str, content: str) -> Dict[str, Any]:
+    def add(
+        self,
+        target: str,
+        content: str,
+        *,
+        skip_content_scan: bool = False,
+    ) -> Dict[str, Any]:
         """Append a new entry. Returns error if it would exceed the char limit."""
         content = content.strip()
         if not content:
             return {"success": False, "error": "Content cannot be empty."}
 
-        # Scan for injection/exfiltration before accepting
-        scan_error = _scan_memory_content(content)
-        if scan_error:
-            return {"success": False, "error": scan_error}
+        # Legacy mode scans content before accepting. In strict mode the
+        # complete memory call was approved by Telegram and no content rule
+        # may reinterpret or block the immutable approved payload.
+        if not skip_content_scan:
+            scan_error = _scan_memory_content(content)
+            if scan_error:
+                return {"success": False, "error": scan_error}
 
         with self._file_lock(self._path_for(target)):
             # Re-read from disk under lock to pick up writes from other sessions.
@@ -446,7 +455,14 @@ class MemoryStore:
 
         return self._success_response(target, "Entry added.")
 
-    def replace(self, target: str, old_text: str, new_content: str) -> Dict[str, Any]:
+    def replace(
+        self,
+        target: str,
+        old_text: str,
+        new_content: str,
+        *,
+        skip_content_scan: bool = False,
+    ) -> Dict[str, Any]:
         """Find entry containing old_text substring, replace it with new_content."""
         old_text = old_text.strip()
         new_content = new_content.strip()
@@ -455,10 +471,10 @@ class MemoryStore:
         if not new_content:
             return {"success": False, "error": "new_content cannot be empty. Use 'remove' to delete entries."}
 
-        # Scan replacement content for injection/exfiltration
-        scan_error = _scan_memory_content(new_content)
-        if scan_error:
-            return {"success": False, "error": scan_error}
+        if not skip_content_scan:
+            scan_error = _scan_memory_content(new_content)
+            if scan_error:
+                return {"success": False, "error": scan_error}
 
         with self._file_lock(self._path_for(target)):
             bak = self._reload_target(target)
@@ -559,7 +575,13 @@ class MemoryStore:
 
         return self._success_response(target, "Entry removed.")
 
-    def apply_batch(self, target: str, operations: List[Dict[str, Any]]) -> Dict[str, Any]:
+    def apply_batch(
+        self,
+        target: str,
+        operations: List[Dict[str, Any]],
+        *,
+        skip_content_scan: bool = False,
+    ) -> Dict[str, Any]:
         """Apply a sequence of add/replace/remove ops to one target atomically.
 
         All operations are validated and applied against the FINAL budget --
@@ -575,15 +597,16 @@ class MemoryStore:
         if not operations:
             return {"success": False, "error": "operations list is empty."}
 
-        # Scan every add/replace content for injection/exfil BEFORE touching
-        # disk -- a single poisoned op rejects the whole batch.
-        for i, op in enumerate(operations):
-            act = (op or {}).get("action")
-            new_content = (op or {}).get("content")
-            if act in {"add", "replace"} and new_content:
-                scan_error = _scan_memory_content(new_content)
-                if scan_error:
-                    return {"success": False, "error": f"Operation {i + 1}: {scan_error}"}
+        if not skip_content_scan:
+            # Legacy mode scans every add/replace content before touching disk
+            # — a single poisoned op rejects the whole batch.
+            for i, op in enumerate(operations):
+                act = (op or {}).get("action")
+                new_content = (op or {}).get("content")
+                if act in {"add", "replace"} and new_content:
+                    scan_error = _scan_memory_content(new_content)
+                    if scan_error:
+                        return {"success": False, "error": f"Operation {i + 1}: {scan_error}"}
 
         with self._file_lock(self._path_for(target)):
             bak = self._reload_target(target)
@@ -919,6 +942,19 @@ def _apply_write_gate(action: str, target: str, content: Optional[str],
     if action not in {"add", "replace", "remove"}:
         return None
 
+    # In strict every-tool mode the complete memory payload has already been
+    # approved by the global Telegram gate. The legacy memory-content policy
+    # must not stage, block, or reinterpret that exact call.
+    try:
+        from tools.strict_approval import strict_mode_enabled
+
+        if strict_mode_enabled():
+            return None
+    except Exception:
+        return tool_error(
+            "Global approval blocked: security subsystem unavailable", success=False
+        )
+
     try:
         from tools import write_approval as wa
     except Exception:
@@ -972,6 +1008,16 @@ def _apply_batch_write_gate(target: str, operations: List[Dict[str, Any]]) -> Op
     (blocked or staged), or None when the caller should perform the real
     batch write. The whole batch is gated as a single unit.
     """
+    try:
+        from tools.strict_approval import strict_mode_enabled
+
+        if strict_mode_enabled():
+            return None
+    except Exception:
+        return tool_error(
+            "Global approval blocked: security subsystem unavailable", success=False
+        )
+
     try:
         from tools import write_approval as wa
     except Exception:
@@ -1051,6 +1097,10 @@ def memory_tool(
     old_text: str = None,
     operations: Optional[List[Dict[str, Any]]] = None,
     store: Optional[MemoryStore] = None,
+    *,
+    _approval_args: Optional[Dict[str, Any]] = None,
+    _tool_call_id: Optional[str] = None,
+    _session_id: Optional[str] = None,
 ) -> str:
     """
     Single entry point for the memory tool. Dispatches to MemoryStore methods.
@@ -1062,6 +1112,34 @@ def memory_tool(
 
     Returns JSON string with results.
     """
+    approval_args = (
+        dict(_approval_args)
+        if isinstance(_approval_args, dict)
+        else {
+            "action": action,
+            "target": target,
+            "content": content,
+            "old_text": old_text,
+            "operations": operations,
+        }
+    )
+    strict_global_approved = False
+    try:
+        from tools.strict_approval import ensure_handler_approval
+
+        strict_global_approved = ensure_handler_approval(
+            "memory",
+            approval_args,
+            tool_call_id=str(_tool_call_id or ""),
+            session_id=str(_session_id or ""),
+            conversation_id=str(_session_id or ""),
+        )
+    except Exception:
+        return tool_error(
+            "Global approval blocked: security subsystem unavailable or call not approved",
+            success=False,
+        )
+
     if store is None:
         return tool_error("Memory is not available. It may be disabled in config or this environment.", success=False)
 
@@ -1081,7 +1159,9 @@ def memory_tool(
         gate_result = _apply_batch_write_gate(target, operations)
         if gate_result is not None:
             return gate_result
-        result = store.apply_batch(target, operations)
+        result = store.apply_batch(
+            target, operations, skip_content_scan=strict_global_approved
+        )
         return json.dumps(result, ensure_ascii=False)
 
     # --- Single-op path ---------------------------------------------------
@@ -1108,10 +1188,12 @@ def memory_tool(
         return gate_result
 
     if action == "add":
-        result = store.add(target, content)
+        result = store.add(target, content, skip_content_scan=strict_global_approved)
 
     elif action == "replace":
-        result = store.replace(target, old_text, content)
+        result = store.replace(
+            target, old_text, content, skip_content_scan=strict_global_approved
+        )
 
     elif action == "remove":
         result = store.remove(target, old_text)
@@ -1220,21 +1302,27 @@ MEMORY_SCHEMA = {
 # --- Registry ---
 from tools.registry import registry, tool_error
 
-registry.register(
-    name="memory",
-    toolset="memory",
-    schema=MEMORY_SCHEMA,
-    handler=lambda args, **kw: memory_tool(
+def _handle_memory(args, **kw):
+    return memory_tool(
         action=args.get("action", ""),
         target=args.get("target", "memory"),
         content=args.get("content"),
         old_text=args.get("old_text"),
         operations=args.get("operations"),
-        store=kw.get("store")),
+        store=kw.get("store"),
+        _approval_args=dict(args) if isinstance(args, dict) else {},
+        _tool_call_id=kw.get("tool_call_id"),
+        _session_id=kw.get("session_id"),
+    )
+
+
+registry.register(
+    name="memory",
+    toolset="memory",
+    schema=MEMORY_SCHEMA,
+    handler=_handle_memory,
     check_fn=check_memory_requirements,
     emoji="🧠",
 )
-
-
 
 

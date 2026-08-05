@@ -88,6 +88,21 @@ def propagate_context_to_thread(target: Callable) -> Callable:
 
     def _runner(*args, **kwargs):
         def _inner():
+            # Session/notifier context is intentionally propagated, but an
+            # approval is not.  A copied context may contain the parent's
+            # one-shot execution markers; clear them before the worker can
+            # dispatch a tool.  If this security boundary cannot be loaded,
+            # fail closed rather than running the worker with inherited proof.
+            try:
+                from tools.strict_approval import clear_inherited_authorization_context
+
+                clear_inherited_authorization_context()
+            except Exception:
+                logger.error(
+                    "Could not clear inherited strict-approval context; blocking worker",
+                    exc_info=True,
+                )
+                raise
             if setters is not None:
                 set_approval, set_sudo = setters
                 try:

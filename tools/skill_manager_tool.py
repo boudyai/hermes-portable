@@ -1410,6 +1410,18 @@ def _apply_skill_write_gate(action, name, **payload_kwargs):
         return None
 
     try:
+        from tools.strict_approval import strict_mode_enabled
+
+        if strict_mode_enabled():
+            # The exact full skill_manage payload has already passed the
+            # global gate. Do not add a second legacy staging/policy decision.
+            return None
+    except Exception:
+        return tool_error(
+            "Global approval blocked: security subsystem unavailable", success=False
+        )
+
+    try:
         from tools import write_approval as wa
     except Exception:
         return None  # fail open
@@ -1478,6 +1490,18 @@ def _maybe_debounced_sync_push(skill_name: str) -> None:
     on sync).
     """
     global _sync_push_timer, _sync_push_lock
+    # The sync hook performs a background HTTP write outside the tool
+    # dispatcher.  In strict global HITL mode it must never turn one approved
+    # skill mutation into an unattended network call.
+    try:
+        from tools.strict_approval import strict_mode_enabled
+
+        if strict_mode_enabled():
+            logger.info("Skipping unattended skill sync push in every_tool mode")
+            return
+    except Exception:
+        logger.warning("Skipping skill sync push: approval subsystem unavailable")
+        return
     try:
         from tools.skill_usage import is_sync_enabled
 
@@ -1521,12 +1545,48 @@ def skill_manage(
     new_string: str = None,
     replace_all: bool = False,
     absorbed_into: str = None,
+    *,
+    _approval_args: Optional[Dict[str, Any]] = None,
+    _tool_call_id: Optional[str] = None,
+    _session_id: Optional[str] = None,
 ) -> str:
     """
     Manage user-created skills. Dispatches to the appropriate action handler.
 
     Returns JSON string with results.
     """
+    approval_args = (
+        dict(_approval_args)
+        if isinstance(_approval_args, dict)
+        else {
+            "action": action,
+            "name": name,
+            "content": content,
+            "category": category,
+            "file_path": file_path,
+            "file_content": file_content,
+            "old_string": old_string,
+            "new_string": new_string,
+            "replace_all": replace_all,
+            "absorbed_into": absorbed_into,
+        }
+    )
+    try:
+        from tools.strict_approval import ensure_handler_approval
+
+        ensure_handler_approval(
+            "skill_manage",
+            approval_args,
+            tool_call_id=str(_tool_call_id or ""),
+            session_id=str(_session_id or ""),
+            conversation_id=str(_session_id or ""),
+        )
+    except Exception:
+        return tool_error(
+            "Global approval blocked: security subsystem unavailable or call not approved",
+            success=False,
+        )
+
     preflight = _background_review_preflight(action, name)
     if preflight is not None:
         return json.dumps(preflight, ensure_ascii=False)
@@ -1763,6 +1823,9 @@ registry.register(
         old_string=args.get("old_string"),
         new_string=args.get("new_string"),
         replace_all=args.get("replace_all", False),
-        absorbed_into=args.get("absorbed_into")),
+        absorbed_into=args.get("absorbed_into"),
+        _approval_args=dict(args) if isinstance(args, dict) else {},
+        _tool_call_id=kw.get("tool_call_id"),
+        _session_id=kw.get("session_id")),
     emoji="📝",
 )

@@ -453,6 +453,87 @@ def _run_agent_tool_execution_middleware(
 
         block_message = scope_block
         block_error_type = "tool_scope_block"
+
+        # Establish the global proof before plugin hooks or guardrails run.
+        # A pre-tool plugin is extension code and may itself request the
+        # legacy approval UI; letting it run first would violate the strict
+        # Telegram-only flow even though the actual handler is gated later.
+        _strict_token = None
+
+        def _reset_strict_token() -> None:
+            nonlocal _strict_token
+            if _strict_token is None:
+                return
+            try:
+                from tools.strict_approval import reset_authorized_call
+
+                reset_authorized_call(_strict_token)
+            except Exception:
+                logger.error("Failed to reset strict approval context", exc_info=True)
+            finally:
+                _strict_token = None
+
+        if block_message is None:
+            try:
+                from tools.strict_approval import (
+                    clear_inherited_authorization_context,
+                    enter_authorized_call,
+                    require_tool_approval,
+                )
+
+                clear_inherited_authorization_context()
+                _strict_invocation = require_tool_approval(
+                    function_name,
+                    final_args,
+                    tool_call_id=tool_call_id or "",
+                    session_id=str(getattr(agent, "session_id", "") or ""),
+                    conversation_id=str(getattr(agent, "session_id", "") or ""),
+                )
+                if _strict_invocation is not None:
+                    final_args = _strict_invocation.args
+                    state["args"] = final_args
+                    _strict_token = enter_authorized_call(_strict_invocation)
+            except Exception as _strict_err:
+                try:
+                    from tools.strict_approval import strict_mode_enabled
+
+                    if strict_mode_enabled():
+                        _advance_start_order()
+                        state["blocked"] = True
+                        result = json.dumps(
+                            {"error": f"Global approval blocked: {_strict_err}"},
+                            ensure_ascii=False,
+                        )
+                        _emit_terminal_post_tool_call(
+                            agent,
+                            function_name=function_name,
+                            function_args=final_args,
+                            result=result,
+                            effective_task_id=effective_task_id,
+                            tool_call_id=tool_call_id,
+                            status="blocked",
+                            error_type=type(_strict_err).__name__,
+                            error_message=str(_strict_err),
+                            middleware_trace=list(state["middleware_trace"]),
+                        )
+                        return result
+                except Exception as _strict_mode_err:
+                    logger.error(
+                        "Strict approval subsystem failed closed: %s",
+                        _strict_mode_err,
+                    )
+                    _advance_start_order()
+                    state["blocked"] = True
+                    return json.dumps(
+                        {
+                            "error": (
+                                "Global approval blocked: security subsystem unavailable"
+                            )
+                        },
+                        ensure_ascii=False,
+                    )
+                raise
+
         if block_message is None:
             block_error_type = "plugin_block"
 
@@ -491,6 +572,7 @@ def _run_agent_tool_execution_middleware(
         if block_message is not None or guardrail_decision is not None:
             _advance_start_order()
             state["blocked"] = True
+            _reset_strict_token()
             if block_message is not None:
                 result = json.dumps({"error": block_message}, ensure_ascii=False)
                 error_type = block_error_type
@@ -516,13 +598,22 @@ def _run_agent_tool_execution_middleware(
             )
             return result
 
+        # This is the common boundary for direct agent-loop tools (memory,
+        # session_search, delegation, context-engine and provider tools) as
+        # well as registry-backed tools.  The registry dispatcher has a
+        # second defensive gate for callers that bypass this module.  The
+        # one-use context marker prevents that nested dispatch from asking
+        # twice while never granting a reusable/session approval.
         if function_name == "memory":
             agent._turns_since_memory = 0
         elif function_name == "skill_manage":
             agent._iters_since_skill = 0
 
-        _advance_start_order(_begin)
-        return execute(final_args)
+        try:
+            _advance_start_order(_begin)
+            return execute(final_args)
+        finally:
+            _reset_strict_token()
 
     def _hermes_pipeline(relay_args: dict[str, Any]) -> Any:
         request_result = apply_tool_request_middleware(
@@ -1607,6 +1698,9 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                     old_text=next_args.get("old_text"),
                     operations=operations,
                     store=agent._memory_store,
+                    _approval_args=dict(next_args),
+                    _tool_call_id=tool_call_id,
+                    _session_id=getattr(agent, "session_id", ""),
                 )
                 # Mirror successful built-in memory writes to external
                 # providers. All gating/op-expansion lives behind the manager

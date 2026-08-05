@@ -26,7 +26,7 @@ from tools.tool_backend_helpers import (
 
 
 _DEFAULT_PLATFORM_TOOLSETS = {
-    "cli": "hermes-cli",
+    "cli": "ops",
 }
 
 # Maps a tools_config provider's ``managed_nous_feature`` to the tool-pool

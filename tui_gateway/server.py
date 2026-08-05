@@ -155,6 +155,31 @@ _cfg_cache: dict | None = None
 _cfg_mtime: float | None = None
 _cfg_path = None
 _session_resume_lock = threading.Lock()
+
+
+def _strict_unattended_rpc_reason(operation: str) -> str | None:
+    """Reject direct TUI execution sinks while Telegram HITL is strict.
+
+    These JSON-RPC methods are control-plane entry points, not Telegram-bound
+    model tool calls. Letting them spawn processes, dispatch slash commands,
+    or mutate operator state would create an approval-free side door. The
+    TUI can still use read-only/status RPCs; an operator who intentionally
+    wants local TUI execution can start the process with a legacy approval
+    mode before it begins.
+    """
+    try:
+        from tools.strict_approval import strict_mode_enabled
+
+        if not strict_mode_enabled():
+            return None
+    except Exception:
+        return "every_tool approval subsystem unavailable"
+    return (
+        f"{operation} is blocked while approvals.mode=every_tool; "
+        "use a Telegram-bound approved tool call"
+    )
+
+
 try:
     _slash_timeout = float(os.environ.get("HERMES_TUI_SLASH_TIMEOUT_S") or "45")
 except (ValueError, TypeError):
@@ -3901,7 +3926,7 @@ def _write_config_key(key_path: str, value):
 
 
 _STATUSBAR_MODES = frozenset({"off", "top", "bottom"})
-_APPROVAL_MODES = frozenset({"manual", "smart", "off"})
+_APPROVAL_MODES = frozenset({"every_tool", "manual", "smart", "off"})
 
 
 def _load_approval_mode() -> str:
@@ -10756,7 +10781,7 @@ def _(rid, params: dict) -> dict:
             return _err(
                 rid,
                 4002,
-                f"unknown approval mode: {value}; pick one of manual|smart|off",
+                f"unknown approval mode: {value}; pick one of every_tool|manual|smart|off",
             )
 
         _write_config_key("approvals.mode", raw)
