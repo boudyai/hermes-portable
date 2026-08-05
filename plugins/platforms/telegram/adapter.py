@@ -5547,8 +5547,8 @@ class TelegramAdapter(BasePlatformAdapter):
             approval_id = str(approval["approval_id"])
             keyboard = InlineKeyboardMarkup([
                 [
-                    InlineKeyboardButton("Разрешить один раз", callback_data=f"ga:a:{approval_id}"),
-                    InlineKeyboardButton("Отклонить", callback_data=f"ga:d:{approval_id}"),
+                    InlineKeyboardButton("🥦", callback_data=f"ga:a:{approval_id}"),
+                    InlineKeyboardButton("🦀", callback_data=f"ga:d:{approval_id}"),
                 ]
             ])
             chat_id = str(approval["telegram_chat_id"])

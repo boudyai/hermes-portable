@@ -2,6 +2,7 @@
 
 import os
 import sys
+import time
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -199,6 +200,47 @@ class TestTelegramExecApproval:
         assert "Fix \\[issue\\]\\_1" in sent["text"]
         assert "alpha\\_beta" in sent["text"]
 
+
+class TestTelegramStrictToolApproval:
+    """Strict global HITL uses compact labels without changing callbacks."""
+
+    @pytest.mark.asyncio
+    async def test_uses_broccoli_allow_and_crab_deny_buttons(self, monkeypatch):
+        adapter = _make_adapter()
+        adapter._bot.send_message = AsyncMock(return_value=SimpleNamespace(message_id=42))
+        buttons = []
+        captured_rows = []
+
+        def make_button(text, callback_data):
+            button = (text, callback_data)
+            buttons.append(button)
+            return button
+
+        monkeypatch.setattr(
+            "plugins.platforms.telegram.adapter.InlineKeyboardButton", make_button
+        )
+        monkeypatch.setattr(
+            "plugins.platforms.telegram.adapter.InlineKeyboardMarkup",
+            lambda rows: captured_rows.extend(rows) or rows,
+        )
+
+        result = await adapter.send_strict_tool_approval(
+            approval={
+                "approval_id": "approval-123",
+                "tool_name": "terminal",
+                "args": {"command": "true"},
+                "expires_at": time.time() + 300,
+                "telegram_chat_id": "12345",
+            }
+        )
+
+        assert result.success is True
+        assert buttons == [
+            ("🥦", "ga:a:approval-123"),
+            ("🦀", "ga:d:approval-123"),
+        ]
+        assert captured_rows == [buttons]
+
 # _handle_callback_query — approval button clicks
 # ===========================================================================
 
@@ -359,4 +401,3 @@ class TestTelegramApprovalCallback:
         assert runner.last_source is not None
         assert runner.last_source.platform == Platform.TELEGRAM
         assert runner.last_source.user_id == "222"
-
