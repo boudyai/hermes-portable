@@ -2182,7 +2182,7 @@ def _exempt_explicit_platform_native(
 #: schemas to a user with no Nous credential — the same split Home Assistant
 #: uses. Probing the portal from this path would put a network call on every
 #: CLI start, gateway session and cron tick.
-_RECENTLY_SHIPPED_TOOLSETS = frozenset({"bfl"})
+_RECENTLY_SHIPPED_TOOLSETS = frozenset({"bfl", "ops", "wiki"})
 
 
 def _enable_recently_shipped_toolsets(
@@ -2238,13 +2238,24 @@ def _get_platform_tools(
     explicitly_configured = isinstance(toolset_names, list)
 
     if toolset_names is None or not isinstance(toolset_names, list):
-        plat_info = PLATFORMS.get(platform)
-        if plat_info:
-            default_ts = plat_info["default_toolset"]
+        # ``toolsets`` predates platform-scoped configuration and is still a
+        # supported explicit CLI override. Do not let the new ops default
+        # silently erase an operator's saved ``toolsets: [hermes-cli]``. Other
+        # platforms use their own safe defaults unless they have an explicit
+        # platform_toolsets entry.
+        legacy_cli_toolsets = config.get("toolsets") if platform == "cli" else None
+        if isinstance(legacy_cli_toolsets, list) and legacy_cli_toolsets:
+            toolset_names = legacy_cli_toolsets
         else:
-            # Plugin platform — derive toolset name from platform key
-            default_ts = f"hermes-{platform}"
-        toolset_names = [default_ts]
+            plat_info = PLATFORMS.get(platform)
+            if plat_info:
+                default_ts = plat_info["default_toolset"]
+                if platform in {"telegram", "cron", "api_server"}:
+                    default_ts = "ops"
+            else:
+                # Plugin platform — derive toolset name from platform key
+                default_ts = f"hermes-{platform}"
+            toolset_names = [default_ts]
 
     # YAML may parse bare numeric names (e.g. ``12306:``) as int.
     # Normalise to str so downstream sorted() never mixes types.

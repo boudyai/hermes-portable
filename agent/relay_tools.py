@@ -24,6 +24,16 @@ def execute(
     metadata: dict[str, Any] | None = None,
 ) -> tuple[Any, dict[str, Any]]:
     """Run one tool call through Relay and return its final arguments."""
+    # Relay is an optional managed-execution wrapper. In strict global HITL
+    # mode it must not become a second execution dispatcher that can invoke a
+    # tool, rewrite it, or perform side effects before Hermes' Telegram gate.
+    # Keep the one canonical Hermes callback boundary and let that callback
+    # perform the approval/immutable-payload check.
+    from tools.strict_approval import strict_mode_enabled
+
+    if strict_mode_enabled():
+        return callback(args), args
+
     runtime, session, parent = relay_runtime.resolve_execution_context(session_id)
     if runtime is None or session is None or not runtime.managed_execution_enabled():
         return callback(args), args

@@ -9,7 +9,10 @@ DEFAULT_CONFIG = {
     "providers": {},
     "fallback_providers": [],
     "credential_pool_strategies": {},
-    "toolsets": ["hermes-cli"],
+    # Ops is the default profile. Every tool call is approved in Telegram
+    # before execution; users can explicitly select a legacy profile when
+    # running an offline/interactive installation.
+    "toolsets": ["ops"],
     # SQLite journal mode used by every Hermes database opener. WAL is the
     # normal default; set DELETE for weak-fsync/shared filesystems where WAL is
     # not crash-safe (for example macOS virtiofs, NFS, or SMB).
@@ -2026,10 +2029,12 @@ DEFAULT_CONFIG = {
         "allowed_rooms": "",           # If set, bot ONLY responds in these room IDs (whitelist)
     },
 
-    # Approval mode for dangerous commands:
-    #   manual — always prompt the user
-    #   smart  — use auxiliary LLM to auto-approve low-risk commands (default)
-    #   off    — skip all approval prompts (equivalent to --yolo)
+    # Global approval mode:
+    #   every_tool — every enabled tool waits for one Telegram approval.
+    # Legacy modes remain available when explicitly selected:
+    #   manual — legacy dangerous-command prompt mode
+    #   smart  — legacy auxiliary-LLM command assessment mode
+    #   off    — legacy bypass mode (equivalent to --yolo)
     #
     # cron_mode — what to do when a cron job hits a dangerous command:
     #   deny    — block the command and let the agent find another way (default, safe)
@@ -2041,8 +2046,13 @@ DEFAULT_CONFIG = {
     # immediately — 60s proved too tight on Telegram/Discord (the prompt
     # expired before the user reached their phone), so the default is 300.
     "approvals": {
-        "mode": "smart",
+        "mode": "every_tool",
         "timeout": 300,
+        # Strict global mode: every tool call waits for one Telegram decision.
+        # The legacy keys above remain for manual/smart/off compatibility.
+        "timeout_seconds": 300,
+        "allow_session_approval": False,
+        "allow_permanent_approval": False,
         "cron_mode": "deny",
         # Operator-customizable policy text for smart approvals. When
         # non-empty, this is appended to the smart-approval guardian's
@@ -2085,6 +2095,24 @@ DEFAULT_CONFIG = {
         # false.  TUI has its own modal overlay (HERMES_TUI_NO_CONFIRM=1 to
         # opt out there).
         "destructive_slash_confirm": True,
+    },
+
+    # Named safe operations profile for explicit profile selection tools.
+    "ops_profile": {
+        "toolsets": ["ops"],
+        "wiki_enabled": True,
+        "approvals": {
+            "mode": "every_tool",
+            "timeout_seconds": 300,
+            "allow_session_approval": False,
+            "allow_permanent_approval": False,
+        },
+    },
+
+    # Local operator wiki. The wiki tool confines all paths below this root.
+    "wiki": {
+        "enabled": True,
+        "root": "~/.hermes/wiki",
     },
 
     # Permanently allowed dangerous command patterns (added via "always" approval)

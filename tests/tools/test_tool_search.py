@@ -34,6 +34,21 @@ def _td(name: str, description: str = "", properties: Dict[str, Any] | None = No
     }
 
 
+@pytest.fixture(autouse=True)
+def _use_legacy_approval_for_bridge_unit_tests(monkeypatch):
+    """Keep bridge-dispatch tests focused on catalog behavior.
+
+    The product default is now ``every_tool`` and is covered by the strict
+    approval suite. These tests exercise the pure bridge/catalog plumbing and
+    intentionally do not set up a Telegram notifier, so make that legacy
+    assumption explicit instead of accidentally depending on a developer's
+    local config.
+    """
+    from tools import strict_approval
+
+    monkeypatch.setattr(strict_approval, "_strict_config", lambda: (False, 0.0))
+
+
 # ---------------------------------------------------------------------------
 # Config parsing
 # ---------------------------------------------------------------------------

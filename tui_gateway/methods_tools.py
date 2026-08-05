@@ -38,6 +38,9 @@ def _(rid, params: dict) -> dict:
 
 @method("process.stop")
 def _(rid, params: dict) -> dict:
+    strict_reason = _strict_unattended_rpc_reason("process.stop")
+    if strict_reason:
+        return _err(rid, 4030, strict_reason)
     try:
         from tools.process_registry import process_registry
 
@@ -68,6 +71,9 @@ def _(rid, params: dict) -> dict:
     proc_id = str(params.get("process_id") or "")
     if not proc_id:
         return _err(rid, 4012, "process_id required")
+    strict_reason = _strict_unattended_rpc_reason("process.kill")
+    if strict_reason:
+        return _err(rid, 4030, strict_reason)
     try:
         from tools.process_registry import process_registry
 
@@ -83,6 +89,9 @@ def _(rid, params: dict) -> dict:
 
 @method("reload.mcp")
 def _(rid, params: dict) -> dict:
+    strict_reason = _strict_unattended_rpc_reason("reload.mcp")
+    if strict_reason:
+        return _err(rid, 4030, strict_reason)
     session = _sessions.get(params.get("session_id", ""))
     try:
         # Gate: /reload-mcp invalidates the prompt cache for this session.
@@ -243,6 +252,9 @@ def _(rid, params: dict) -> dict:
     CLI's ``/reload``.  Users who want a brand-new credential resolution
     should follow with ``/new``.
     """
+    strict_reason = _strict_unattended_rpc_reason("reload.env")
+    if strict_reason:
+        return _err(rid, 4030, strict_reason)
     try:
         from hermes_cli.config import reload_env
 
@@ -371,6 +383,9 @@ def _(rid, params: dict) -> dict:
 @method("cli.exec")
 def _(rid, params: dict) -> dict:
     """Run `python -m hermes_cli.main` with argv; capture stdout/stderr (non-interactive only)."""
+    strict_reason = _strict_unattended_rpc_reason("cli.exec")
+    if strict_reason:
+        return _err(rid, 4030, strict_reason)
     argv = params.get("argv", [])
     if not isinstance(argv, list) or not all(isinstance(x, str) for x in argv):
         return _err(rid, 4003, "argv must be list[str]")
@@ -431,6 +446,9 @@ def _(rid, params: dict) -> dict:
 
 @method("command.dispatch")
 def _(rid, params: dict) -> dict:
+    strict_reason = _strict_unattended_rpc_reason("command.dispatch")
+    if strict_reason:
+        return _err(rid, 4030, strict_reason)
     name, arg = params.get("name", "").lstrip("/"), params.get("arg", "")
     resolved = _resolve_name(name)
     if resolved != name:
@@ -1072,6 +1090,9 @@ def _(rid, params: dict) -> dict:
 
 @method("slash.exec")
 def _(rid, params: dict) -> dict:
+    strict_reason = _strict_unattended_rpc_reason("slash.exec")
+    if strict_reason:
+        return _err(rid, 4030, strict_reason)
     session, err = _sess_nowait(params, rid)
     if err:
         return err
@@ -1267,6 +1288,9 @@ def _(rid, params: dict) -> dict:
 
 @method("rollback.restore")
 def _(rid, params: dict) -> dict:
+    strict_reason = _strict_unattended_rpc_reason("rollback.restore")
+    if strict_reason:
+        return _err(rid, 4030, strict_reason)
     session, err = _sess(params, rid)
     if err:
         return err
@@ -1347,6 +1371,10 @@ def _(rid, params: dict) -> dict:
     if action == "status":
         url = _resolve_browser_cdp_url()
         return _ok(rid, {"connected": bool(url), "url": url})
+
+    strict_reason = _strict_unattended_rpc_reason("browser.manage")
+    if strict_reason:
+        return _err(rid, 4030, strict_reason)
 
     if action == "disconnect":
         return _browser_disconnect(rid)
@@ -1496,6 +1524,9 @@ def _(rid, params: dict) -> dict:
 
 @method("tools.configure")
 def _(rid, params: dict) -> dict:
+    strict_reason = _strict_unattended_rpc_reason("tools.configure")
+    if strict_reason:
+        return _err(rid, 4030, strict_reason)
     action = str(params.get("action", "") or "").strip().lower()
     targets = [
         str(name).strip() for name in params.get("names", []) or [] if str(name).strip()
@@ -1682,6 +1713,9 @@ def _(rid, params: dict) -> dict:
 @method("learning.delete")
 def _(rid, params: dict) -> dict:
     """Delete a journey node — skills are archived (restorable), memories removed."""
+    strict_reason = _strict_unattended_rpc_reason("learning.delete")
+    if strict_reason:
+        return _err(rid, 4030, strict_reason)
     try:
         from agent.learning_mutations import delete_node
 
@@ -1693,6 +1727,9 @@ def _(rid, params: dict) -> dict:
 @method("learning.edit")
 def _(rid, params: dict) -> dict:
     """Rewrite a journey node's content (SKILL.md or memory chunk)."""
+    strict_reason = _strict_unattended_rpc_reason("learning.edit")
+    if strict_reason:
+        return _err(rid, 4030, strict_reason)
     try:
         from agent.learning_mutations import edit_node
 
@@ -1703,6 +1740,9 @@ def _(rid, params: dict) -> dict:
 
 @method("skills.manage")
 def _(rid, params: dict) -> dict:
+    strict_reason = _strict_unattended_rpc_reason("skills.manage")
+    if strict_reason:
+        return _err(rid, 4030, strict_reason)
     action, query = params.get("action", "list"), params.get("query", "")
     try:
         if action == "list":
@@ -1762,6 +1802,9 @@ def _(rid, params: dict) -> dict:
 
 @method("skills.reload")
 def _(rid, params: dict) -> dict:
+    strict_reason = _strict_unattended_rpc_reason("skills.reload")
+    if strict_reason:
+        return _err(rid, 4030, strict_reason)
     try:
         from agent.skill_commands import reload_skills
 
@@ -1799,6 +1842,9 @@ def _(rid, params: dict) -> dict:
       - ``toggle`` → flip ``name`` based on ``enable`` (bool). Returns the
                        refreshed row plus {"ok", "unchanged"}.
     """
+    strict_reason = _strict_unattended_rpc_reason("plugins.manage")
+    if strict_reason:
+        return _err(rid, 4030, strict_reason)
     action = params.get("action", "list")
     try:
         from hermes_cli.plugins_cmd import (
@@ -1866,6 +1912,9 @@ def _(rid, params: dict) -> dict:
 
 @method("shell.exec")
 def _(rid, params: dict) -> dict:
+    strict_reason = _strict_unattended_rpc_reason("shell.exec")
+    if strict_reason:
+        return _err(rid, 4030, strict_reason)
     cmd = params.get("command", "")
     if not cmd:
         return _err(rid, 4004, "empty command")

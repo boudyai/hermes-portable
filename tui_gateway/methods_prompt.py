@@ -719,6 +719,9 @@ def _(rid, params: dict) -> dict:
 
 @method("prompt.background")
 def _(rid, params: dict) -> dict:
+    strict_reason = _strict_unattended_rpc_reason("prompt.background")
+    if strict_reason:
+        return _err(rid, 4030, strict_reason)
     session, err = _sess(params, rid)
     if err:
         return err
@@ -765,6 +768,9 @@ def _(rid, params: dict) -> dict:
 
 @method("preview.restart")
 def _(rid, params: dict) -> dict:
+    strict_reason = _strict_unattended_rpc_reason("preview.restart")
+    if strict_reason:
+        return _err(rid, 4030, strict_reason)
     session, err = _sess(params, rid)
     if err:
         return err

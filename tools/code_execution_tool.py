@@ -1267,6 +1267,8 @@ def execute_code(
     code: str,
     task_id: Optional[str] = None,
     enabled_tools: Optional[List[str]] = None,
+    tool_call_id: Optional[str] = None,
+    session_id: Optional[str] = None,
 ) -> str:
     """
     Run a Python script in a sandboxed child process with RPC access
@@ -1284,6 +1286,28 @@ def execute_code(
     Returns:
         JSON string with execution results.
     """
+    # The registry normally establishes this exact execution scope.  The
+    # direct public function also defends itself so importing and calling
+    # execute_code() cannot turn the mode flag into implicit approval.
+    try:
+        from tools.strict_approval import ensure_handler_approval
+
+        _strict_handler_approved = ensure_handler_approval(
+            "execute_code",
+            {"code": code},
+            tool_call_id=str(tool_call_id or ""),
+            session_id=str(session_id or task_id or ""),
+            conversation_id=str(session_id or task_id or ""),
+        )
+    except Exception as strict_error:
+        logger.error("execute_code global approval blocked: %s", strict_error)
+        return json.dumps({
+            "status": "error",
+            "error": "Global approval blocked: security subsystem unavailable or call not approved",
+            "tool_calls_made": 0,
+            "duration_seconds": 0,
+        }, ensure_ascii=False)
+
     if not SANDBOX_AVAILABLE:
         return tool_error(
             "execute_code sandbox is unavailable in this environment. "
@@ -1298,24 +1322,29 @@ def execute_code(
     _env_config = _get_env_config()
     env_type = _env_config["env_type"]
 
-    # execute_code runs arbitrary Python (subprocess/os.system/...) that never
-    # passes through terminal()/DANGEROUS_PATTERNS, so guard the whole script
-    # here before either dispatch path spawns it. Runs synchronously in the
-    # caller (tool-executor) thread, which holds the session context (#30882).
-    # A Docker sandbox with host bind mounts is no longer isolated, so its
-    # script does not get the container fast-path.
-    from tools.approval import check_execute_code_guard
-    _guard = check_execute_code_guard(
-        code, env_type,
-        has_host_access=_docker_has_host_access(_env_config),
-    )
-    if not _guard.get("approved", False):
-        return json.dumps({
-            "status": "error",
-            "error": _guard.get("message") or "execute_code blocked by approval guard.",
-            "tool_calls_made": 0,
-            "duration_seconds": 0,
-        }, ensure_ascii=False)
+    # Legacy mode retains the whole-script guard.  Strict every-tool mode has
+    # already approved the immutable execute_code payload and must not make a
+    # second regex, smart, or memory-backed approval decision.
+    if _strict_handler_approved:
+        _guard = {"approved": True, "user_approved": True}
+    else:
+        # execute_code runs arbitrary Python (subprocess/os.system/...) that
+        # never passes through terminal()/DANGEROUS_PATTERNS, so guard the
+        # whole script before either dispatch path spawns it. A Docker sandbox
+        # with host bind mounts is no longer isolated.
+        from tools.approval import check_execute_code_guard
+
+        _guard = check_execute_code_guard(
+            code, env_type,
+            has_host_access=_docker_has_host_access(_env_config),
+        )
+        if not _guard.get("approved", False):
+            return json.dumps({
+                "status": "error",
+                "error": _guard.get("message") or "execute_code blocked by approval guard.",
+                "tool_calls_made": 0,
+                "duration_seconds": 0,
+            }, ensure_ascii=False)
 
     # Clean interrupt slate for a user-approved script before EITHER dispatch
     # path spawns it: drop a stale bit that landed on this thread during the
@@ -2080,7 +2109,9 @@ registry.register(
     handler=lambda args, **kw: execute_code(
         code=args.get("code", ""),
         task_id=kw.get("task_id"),
-        enabled_tools=kw.get("enabled_tools")),
+        enabled_tools=kw.get("enabled_tools"),
+        tool_call_id=kw.get("tool_call_id"),
+        session_id=kw.get("session_id")),
     check_fn=check_sandbox_requirements,
     emoji="🐍",
     max_result_size_chars=100_000,

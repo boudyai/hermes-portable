@@ -373,6 +373,21 @@ def _check_all_guards(command: str, env_type: str,
                                   has_host_access=has_host_access)
 
 
+def _run_legacy_guard_if_needed(
+    command: str,
+    env_type: str,
+    *,
+    has_host_access: bool = False,
+    strict_handler_approved: bool = False,
+    force: bool = False,
+) -> dict:
+    """Run the legacy command policy only outside strict handler scope."""
+
+    if strict_handler_approved or force:
+        return {"approved": True}
+    return _check_all_guards(command, env_type, has_host_access=has_host_access)
+
+
 # Allowlist: characters that can legitimately appear in directory paths.
 # Covers Unicode letters/digits, path separators, Windows drive/UNC separators,
 # tilde, dot, hyphen, underscore, space, plus, at, equals, and comma.  Shell
@@ -2244,6 +2259,8 @@ def terminal_tool(
     pty: bool = False,
     notify_on_complete: bool = False,
     watch_patterns: Optional[List[str]] = None,
+    _approval_args: Optional[Dict[str, Any]] = None,
+    _tool_call_id: Optional[str] = None,
 ) -> str:
     """
     Execute a command in the configured terminal environment.
@@ -2277,6 +2294,44 @@ def terminal_tool(
         # Note: force parameter is internal only, not exposed to model API
     """
     try:
+        # ``registry.dispatch`` normally establishes the exact execution
+        # marker before entering this function.  Keep a direct-call defence as
+        # well: integrations that call terminal_tool() directly must obtain a
+        # fresh Telegram approval and must never treat the mode flag itself as
+        # approval.
+        _terminal_approval_args = (
+            dict(_approval_args)
+            if isinstance(_approval_args, dict)
+            else {
+                "command": command,
+                "background": background,
+                "timeout": timeout,
+                "workdir": workdir,
+                "pty": pty,
+                "notify_on_complete": notify_on_complete,
+                "watch_patterns": watch_patterns,
+                "force": force,
+            }
+        )
+        try:
+            from tools.strict_approval import ensure_handler_approval
+
+            _strict_handler_approved = ensure_handler_approval(
+                "terminal",
+                _terminal_approval_args,
+                tool_call_id=str(_tool_call_id or ""),
+                session_id=str(session_id or task_id or ""),
+                conversation_id=str(session_id or task_id or ""),
+            )
+        except Exception as strict_error:
+            logger.error("Terminal global approval blocked: %s", strict_error)
+            return json.dumps({
+                "output": "",
+                "exit_code": -1,
+                "error": "Global approval blocked: security subsystem unavailable or call not approved",
+                "status": "blocked",
+            }, ensure_ascii=False)
+
         if not isinstance(command, str):
             logger.warning(
                 "Rejected invalid terminal command value: %s",
@@ -2577,16 +2632,18 @@ def terminal_tool(
 
         # Pre-exec security checks (tirith + dangerous command detection)
         # Skip check if force=True (user has confirmed they want to run it)
-        approval_note = None
+        approval_note = "Global one-time approval granted." if _strict_handler_approved else None
         # True when the user explicitly approved this run (or pre-confirmed via
         # force).  Drives the clean-interrupt-slate clear before env.execute so
         # an approved command can't be SIGINT-killed by a bit that landed during
         # the approval-wait (see clear_current_thread_interrupt).
-        _approved_run = bool(force)
-        if not force:
-            approval = _check_all_guards(
+        _approved_run = bool(force) or _strict_handler_approved
+        if not force and not _strict_handler_approved:
+            approval = _run_legacy_guard_if_needed(
                 command, env_type,
                 has_host_access=_docker_has_host_access(config),
+                strict_handler_approved=_strict_handler_approved,
+                force=force,
             )
             if not approval["approved"]:
                 # Check if this is an approval_required (gateway ask mode)
@@ -3392,6 +3449,8 @@ def _handle_terminal(args, **kw):
         pty=args.get("pty", False),
         notify_on_complete=args.get("notify_on_complete", False),
         watch_patterns=args.get("watch_patterns"),
+        _approval_args=dict(args) if isinstance(args, dict) else {},
+        _tool_call_id=kw.get("tool_call_id"),
     )
 
 

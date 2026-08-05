@@ -769,7 +769,66 @@ class ToolRegistry:
         entry = self.get_entry(name)
         if not entry:
             return tool_error(f"Unknown tool: {name}")
+        _strict_execution_token = None
         try:
+            # Registry.dispatch is also a public execution path used by
+            # plugins, MCP wrappers and tests. Keep the gate here as the last
+            # common boundary. model_tools/agent.tool_executor install a
+            # one-use marker first; this call consumes it instead of asking a
+            # second question for the same exact invocation.
+            try:
+                from tools.strict_approval import (
+                    authorized_call_id,
+                    begin_authorized_execution,
+                    clear_inherited_authorization_context,
+                    consume_authorized_call,
+                    require_tool_approval,
+                    reset_authorized_execution,
+                )
+
+                supplied_call_id = str(kwargs.get("tool_call_id") or "")
+                marker_call_id = authorized_call_id()
+                consumed = consume_authorized_call(
+                    name,
+                    args if isinstance(args, dict) else {},
+                    tool_call_id=supplied_call_id,
+                )
+                if not consumed:
+                    # A marker for another call is not reusable proof. Clear
+                    # it before obtaining a fresh approval so it cannot be
+                    # replayed by a later nested call.
+                    clear_inherited_authorization_context()
+                    invocation = require_tool_approval(
+                        name,
+                        args if isinstance(args, dict) else {},
+                        tool_call_id=str(kwargs.get("tool_call_id") or ""),
+                        session_id=str(kwargs.get("session_id") or ""),
+                        conversation_id=str(kwargs.get("session_id") or ""),
+                    )
+                    if invocation is not None:
+                        args = invocation.args
+                        kwargs["tool_call_id"] = invocation.tool_call_id
+                elif not supplied_call_id and marker_call_id:
+                    # A direct public registry caller may omit an id. Preserve
+                    # the generated id from the outer approval through the
+                    # handler scope instead of silently dropping the binding.
+                    kwargs["tool_call_id"] = marker_call_id
+                execution_call_id = str(kwargs.get("tool_call_id") or "")
+                _strict_execution_token = begin_authorized_execution(
+                    name,
+                    args if isinstance(args, dict) else {},
+                    tool_call_id=execution_call_id,
+                )
+            except Exception as strict_error:
+                try:
+                    from tools.strict_approval import strict_mode_enabled
+
+                    if strict_mode_enabled():
+                        return tool_error(f"Global approval blocked: {strict_error}")
+                except Exception:
+                    return tool_error("Global approval blocked: security subsystem unavailable")
+                raise
+
             if entry.is_async:
                 from model_tools import _run_async
                 result = _run_async(entry.handler(args, **kwargs))
@@ -788,6 +847,12 @@ class ToolRegistry:
             except Exception:
                 sanitized = raw  # defensive: never let the sanitizer block error propagation
             return tool_error(sanitized)
+        finally:
+            if _strict_execution_token is not None:
+                try:
+                    reset_authorized_execution(_strict_execution_token)
+                except Exception:
+                    logger.error("Failed to reset strict execution context", exc_info=True)
 
     # ------------------------------------------------------------------
     # Query helpers  (replace redundant dicts in model_tools.py)

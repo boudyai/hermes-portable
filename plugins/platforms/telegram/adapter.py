@@ -5515,6 +5515,74 @@ class TelegramAdapter(BasePlatformAdapter):
             logger.warning("[%s] send_exec_approval failed: %s", self.name, _redact_telegram_error_text(e))
             return SendResult(success=False, error=_redact_telegram_error_text(e))
 
+    async def send_strict_tool_approval(
+        self,
+        *,
+        approval: Dict[str, Any],
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> SendResult:
+        """Send the fail-closed every-tool prompt with exactly two buttons."""
+        if not self._bot:
+            return SendResult(success=False, error="Not connected")
+        try:
+            from tools.strict_approval import (
+                format_telegram_expiration,
+                redact_for_display,
+            )
+
+            tool_name = _html.escape(str(approval.get("tool_name", "")))
+            args = redact_for_display(approval.get("args", "[REDACTED]"))
+            if isinstance(args, str):
+                args_text = args
+            else:
+                args_text = json.dumps(args, ensure_ascii=False, indent=2, sort_keys=True)
+            args_text = _html.escape(args_text[:7000])
+            expires = _html.escape(format_telegram_expiration(float(approval["expires_at"])))
+            text = (
+                "🔐 <b>Подтверждение tool call</b>\n\n"
+                f"<b>Инструмент:</b> <code>{tool_name}</code>\n"
+                f"<b>Аргументы:</b>\n<pre>{args_text}</pre>\n"
+                f"<b>Истекает:</b> {expires}"
+            )
+            approval_id = str(approval["approval_id"])
+            keyboard = InlineKeyboardMarkup([
+                [
+                    InlineKeyboardButton("Разрешить один раз", callback_data=f"ga:a:{approval_id}"),
+                    InlineKeyboardButton("Отклонить", callback_data=f"ga:d:{approval_id}"),
+                ]
+            ])
+            chat_id = str(approval["telegram_chat_id"])
+            thread_id = self._metadata_thread_id(metadata)
+            reply_to_id = self._reply_to_message_id_for_send(
+                None, metadata, reply_to_mode=self._reply_to_mode
+            )
+            kwargs: Dict[str, Any] = {
+                "chat_id": normalize_telegram_chat_id(chat_id),
+                "text": text,
+                "parse_mode": ParseMode.HTML,
+                "reply_markup": keyboard,
+                "reply_to_message_id": reply_to_id,
+                **self._link_preview_kwargs(),
+            }
+            kwargs.update(
+                self._thread_kwargs_for_send(
+                    chat_id,
+                    thread_id,
+                    metadata,
+                    reply_to_message_id=reply_to_id,
+                    reply_to_mode=self._reply_to_mode,
+                )
+            )
+            msg = await self._send_message_with_thread_fallback(**kwargs)
+            return SendResult(success=True, message_id=str(msg.message_id))
+        except Exception as exc:
+            logger.warning(
+                "[%s] send_strict_tool_approval failed: %s",
+                self.name,
+                _redact_telegram_error_text(exc),
+            )
+            return SendResult(success=False, error=_redact_telegram_error_text(exc))
+
     async def send_slash_confirm(
         self, chat_id: str, title: str, message: str, session_key: str,
         confirm_id: str, metadata: Optional[Dict[str, Any]] = None,
@@ -6348,7 +6416,48 @@ class TelegramAdapter(BasePlatformAdapter):
             )
             return
 
-        # --- Exec approval callbacks (ea:choice:id) ---
+        # --- Strict every-tool approval callbacks (ga:action:id) ---
+        if data.startswith("ga:"):
+            parts = data.split(":", 2)
+            if len(parts) != 3 or parts[1] not in {"a", "d"}:
+                await query.answer(text="Некорректное подтверждение.")
+                return
+            action = "approve" if parts[1] == "a" else "deny"
+            approval_id = parts[2]
+            caller_id = str(getattr(query.from_user, "id", ""))
+            caller_chat_id = str(query_chat_id or "")
+            try:
+                from tools.strict_approval import resolve_approval
+
+                resolved = resolve_approval(
+                    approval_id,
+                    action,
+                    telegram_user_id=caller_id,
+                    telegram_chat_id=caller_chat_id,
+                )
+            except Exception as exc:
+                logger.error("Strict Telegram approval callback failed: %s", exc)
+                resolved = False
+
+            if not resolved:
+                await query.answer(text="Истекло, уже обработано или нет доступа.")
+                return
+
+            label = "✅ Разрешено один раз" if action == "approve" else "❌ Отклонено"
+            await query.answer(text=label)
+            try:
+                await query.edit_message_text(
+                    text=self.format_message(label),
+                    parse_mode=ParseMode.MARKDOWN_V2,
+                    reply_markup=None,
+                )
+            except Exception:
+                pass
+            if query_chat_id is not None:
+                self.resume_typing_for_chat(str(query_chat_id))
+            return
+
+        # --- Legacy exec approval callbacks (ea:choice:id) ---
         if data.startswith("ea:"):
             parts = data.split(":", 2)
             if len(parts) == 3:

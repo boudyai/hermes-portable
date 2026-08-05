@@ -1161,7 +1161,24 @@ def handle_function_call(
     # tool name, not the bridge.
     _dispatch_start = time.monotonic()
 
+    _bridge_strict_token = None
+
+    def _reset_bridge_strict_token() -> None:
+        nonlocal _bridge_strict_token
+        if _bridge_strict_token is not None:
+            try:
+                _reset = reset_authorized_call
+            except UnboundLocalError:
+                return
+            try:
+                _reset(_bridge_strict_token)
+            except Exception:
+                logger.error("Failed to reset strict bridge approval context", exc_info=True)
+            finally:
+                _bridge_strict_token = None
+
     def _return_bridge_result(result: Any) -> Any:
+        _reset_bridge_strict_token()
         _emit_post_tool_call_hook(
             function_name=function_name,
             function_args=function_args,
@@ -1183,6 +1200,51 @@ def handle_function_call(
         _ts_mod = None
 
     if _ts_mod is not None and _ts_mod.is_bridge_tool(function_name):
+        # These two bridge operations are real tool calls even though they do
+        # not reach the registry. Gate them here so a direct dispatcher caller
+        # cannot bypass every_tool merely because the catalog result is
+        # read-only. ``tool_call`` is intentionally not gated at this wrapper
+        # level: it immediately resolves to the underlying tool below, which
+        # receives the one and only approval for the actual execution.
+        if function_name in {_ts_mod.TOOL_SEARCH_NAME, _ts_mod.TOOL_DESCRIBE_NAME}:
+            try:
+                from tools.strict_approval import (
+                    clear_inherited_authorization_context,
+                    enter_authorized_call,
+                    is_authorized_call,
+                    require_tool_approval,
+                    reset_authorized_call,
+                )
+
+                if not is_authorized_call(
+                    function_name,
+                    function_args,
+                    tool_call_id=tool_call_id or "",
+                ):
+                    clear_inherited_authorization_context()
+                    bridge_invocation = require_tool_approval(
+                        function_name,
+                        function_args,
+                        tool_call_id=tool_call_id or "",
+                        session_id=session_id or "",
+                        conversation_id=session_id or "",
+                    )
+                    if bridge_invocation is not None:
+                        function_args = bridge_invocation.args
+                        _bridge_strict_token = enter_authorized_call(bridge_invocation)
+            except Exception as bridge_strict_error:
+                try:
+                    from tools.strict_approval import strict_mode_enabled
+
+                    if strict_mode_enabled():
+                        return _return_bridge_result(
+                            tool_error(f"Global approval blocked: {bridge_strict_error}")
+                        )
+                except Exception:
+                    return _return_bridge_result(
+                        tool_error("Global approval blocked: security subsystem unavailable")
+                    )
+                raise
         try:
             # Use skip_tool_search_assembly=True so we see the real catalog,
             # not the already-collapsed bridge-only list (the bridge would
@@ -1204,65 +1266,68 @@ def handle_function_call(
             ) or []
         except Exception:
             current_defs = []
-        if function_name == _ts_mod.TOOL_SEARCH_NAME:
-            return _return_bridge_result(
-                _ts_mod.dispatch_tool_search(
-                    function_args or {},
-                    current_tool_defs=current_defs,
-                )
-            )
-        if function_name == _ts_mod.TOOL_DESCRIBE_NAME:
-            return _return_bridge_result(
-                _ts_mod.dispatch_tool_describe(
-                    function_args or {},
-                    current_tool_defs=current_defs,
-                )
-            )
-        if function_name == _ts_mod.TOOL_CALL_NAME:
-            underlying_name, underlying_args, err = _ts_mod.resolve_underlying_call(function_args or {})
-            if err or not underlying_name:
+        try:
+            if function_name == _ts_mod.TOOL_SEARCH_NAME:
                 return _return_bridge_result(
-                    tool_error(err or "tool_call could not be resolved")
-                )
-            # Defense in depth: the underlying tool MUST be in the session's
-            # scoped deferrable catalog. resolve_underlying_call() only checks
-            # that the name is deferrable in the global registry; this gate
-            # additionally rejects any tool the session was not granted, so a
-            # restricted session can never invoke an out-of-scope tool through
-            # the bridge even if the catalog scoping above regressed.
-            _scoped_deferrable = _ts_mod.scoped_deferrable_names(current_defs)
-            if underlying_name not in _scoped_deferrable:
-                return _return_bridge_result(
-                    tool_error(
-                        f"'{underlying_name}' is not available in this session. "
-                        "Use tool_search to find tools you can call."
+                    _ts_mod.dispatch_tool_search(
+                        function_args or {},
+                        current_tool_defs=current_defs,
                     )
                 )
-            # Probe-validate against the deferred tool's schema (ironclaw#5149):
-            # a blind call missing required arguments returns the parameter
-            # schema instead of dispatching into an opaque downstream failure.
-            _probe_err = _ts_mod.validate_deferred_call_args(underlying_name, underlying_args)
-            if _probe_err is not None:
-                return _return_bridge_result(_probe_err)
-            # Recurse with the underlying tool. All hooks fire against the
-            # real tool name. The bridge is invisible to hooks by design.
-            return handle_function_call(
-                function_name=underlying_name,
-                function_args=underlying_args,
-                task_id=task_id,
-                tool_call_id=tool_call_id,
-                session_id=session_id,
-                turn_id=turn_id,
-                api_request_id=api_request_id,
-                user_task=user_task,
-                enabled_tools=enabled_tools,
-                skip_pre_tool_call_hook=skip_pre_tool_call_hook,
-                skip_tool_request_middleware=skip_tool_request_middleware,
-                skip_tool_execution_middleware=skip_tool_execution_middleware,
-                tool_request_middleware_trace=list(_tool_middleware_trace),
-                enabled_toolsets=enabled_toolsets,
-                disabled_toolsets=disabled_toolsets,
-            )
+            if function_name == _ts_mod.TOOL_DESCRIBE_NAME:
+                return _return_bridge_result(
+                    _ts_mod.dispatch_tool_describe(
+                        function_args or {},
+                        current_tool_defs=current_defs,
+                    )
+                )
+            if function_name == _ts_mod.TOOL_CALL_NAME:
+                underlying_name, underlying_args, err = _ts_mod.resolve_underlying_call(function_args or {})
+                if err or not underlying_name:
+                    return _return_bridge_result(
+                        tool_error(err or "tool_call could not be resolved")
+                    )
+                # Defense in depth: the underlying tool MUST be in the session's
+                # scoped deferrable catalog. resolve_underlying_call() only checks
+                # that the name is deferrable in the global registry; this gate
+                # additionally rejects any tool the session was not granted, so a
+                # restricted session can never invoke an out-of-scope tool through
+                # the bridge even if the catalog scoping above regressed.
+                _scoped_deferrable = _ts_mod.scoped_deferrable_names(current_defs)
+                if underlying_name not in _scoped_deferrable:
+                    return _return_bridge_result(
+                        tool_error(
+                            f"'{underlying_name}' is not available in this session. "
+                            "Use tool_search to find tools you can call."
+                        )
+                    )
+                # Probe-validate against the deferred tool's schema (ironclaw#5149):
+                # a blind call missing required arguments returns the parameter
+                # schema instead of dispatching into an opaque downstream failure.
+                _probe_err = _ts_mod.validate_deferred_call_args(underlying_name, underlying_args)
+                if _probe_err is not None:
+                    return _return_bridge_result(_probe_err)
+                # Recurse with the underlying tool. All hooks fire against the
+                # real tool name. The bridge is invisible to hooks by design.
+                return handle_function_call(
+                    function_name=underlying_name,
+                    function_args=underlying_args,
+                    task_id=task_id,
+                    tool_call_id=tool_call_id,
+                    session_id=session_id,
+                    turn_id=turn_id,
+                    api_request_id=api_request_id,
+                    user_task=user_task,
+                    enabled_tools=enabled_tools,
+                    skip_pre_tool_call_hook=skip_pre_tool_call_hook,
+                    skip_tool_request_middleware=skip_tool_request_middleware,
+                    skip_tool_execution_middleware=skip_tool_execution_middleware,
+                    tool_request_middleware_trace=list(_tool_middleware_trace),
+                    enabled_toolsets=enabled_toolsets,
+                    disabled_toolsets=disabled_toolsets,
+                )
+        finally:
+            _reset_bridge_strict_token()
 
     _tool_original_args = dict(function_args)
     if not skip_tool_request_middleware:
@@ -1284,9 +1349,87 @@ def handle_function_call(
         except Exception as _mw_err:
             logger.debug("tool_request middleware error: %s", _mw_err)
 
+    _strict_approval_token = None
+
+    def _reset_strict_approval_token() -> None:
+        """Drop the one-use marker on every early-return path."""
+
+        nonlocal _strict_approval_token
+        if _strict_approval_token is None:
+            return
+        try:
+            reset_authorized_call(_strict_approval_token)
+        except UnboundLocalError:
+            # The strict import failed before the marker could be installed.
+            pass
+        except Exception:
+            logger.error("Failed to reset strict approval context", exc_info=True)
+        finally:
+            _strict_approval_token = None
+
     try:
         if function_name in _AGENT_LOOP_TOOLS:
             return tool_error(f"{function_name} must be handled by the agent loop")
+
+        # The strict gate is deliberately below request rewriting (the exact
+        # payload that will be dispatched is what the user approves) and above
+        # every registry/MCP/browser/HTTP handler.  Agent-loop special tools
+        # are gated in agent.tool_executor before their direct handlers run.
+        try:
+            from tools.strict_approval import (
+                clear_inherited_authorization_context,
+                enter_authorized_call,
+                is_authorized_call,
+                require_tool_approval,
+                reset_authorized_call,
+            )
+
+            if not is_authorized_call(
+                function_name,
+                function_args,
+                tool_call_id=tool_call_id or "",
+            ):
+                clear_inherited_authorization_context()
+                _strict_invocation = require_tool_approval(
+                    function_name,
+                    function_args,
+                    tool_call_id=tool_call_id or "",
+                    session_id=session_id or "",
+                    conversation_id=session_id or "",
+                )
+                if _strict_invocation is not None:
+                    # Use the immutable payload returned by the store.  This
+                    # prevents a middleware/plugin from changing arguments
+                    # between approval and execution.
+                    function_args = _strict_invocation.args
+                    _strict_approval_token = enter_authorized_call(_strict_invocation)
+        except Exception as _strict_err:
+            # In every_tool mode all errors are security failures.  Legacy
+            # modes retain their existing behavior and never enter this block.
+            try:
+                from tools.strict_approval import strict_mode_enabled
+
+                if strict_mode_enabled():
+                    result = tool_error(f"Global approval blocked: {_strict_err}")
+                    _emit_post_tool_call_hook(
+                        function_name=function_name,
+                        function_args=function_args,
+                        result=result,
+                        task_id=task_id,
+                        session_id=session_id,
+                        tool_call_id=tool_call_id,
+                        turn_id=turn_id,
+                        api_request_id=api_request_id,
+                        status="blocked",
+                        error_type=type(_strict_err).__name__,
+                        error_message=str(_strict_err),
+                        middleware_trace=list(_tool_middleware_trace),
+                    )
+                    return result
+            except Exception as _strict_mode_err:
+                logger.error("Strict approval subsystem failed closed: %s", _strict_mode_err)
+                return tool_error("Global approval blocked: security subsystem unavailable")
+            raise
 
         # Check plugin hooks for a block/approve directive (unless caller
         # already checked — e.g. run_agent._invoke_tool passes skip=True to
@@ -1318,6 +1461,7 @@ def handle_function_call(
 
             if block_message is not None:
                 result = tool_error(block_message)
+                _reset_strict_approval_token()
                 _emit_post_tool_call_hook(
                     function_name=function_name,
                     function_args=function_args,
@@ -1342,6 +1486,7 @@ def handle_function_call(
 
             edit_block_message = maybe_require_edit_approval(function_name, function_args)
             if edit_block_message is not None:
+                _reset_strict_approval_token()
                 _emit_post_tool_call_hook(
                     function_name=function_name,
                     function_args=function_args,
@@ -1360,6 +1505,7 @@ def handle_function_call(
             logger.debug("ACP edit approval guard error: %s", _edit_approval_err)
             if function_name in {"write_file", "patch"}:
                 result = tool_error("Edit approval denied: approval guard failed")
+                _reset_strict_approval_token()
                 _emit_post_tool_call_hook(
                     function_name=function_name,
                     function_args=function_args,
@@ -1414,6 +1560,7 @@ def handle_function_call(
                         function_name, next_args,
                         task_id=task_id,
                         session_id=session_id,
+                        tool_call_id=tool_call_id,
                         enabled_tools=sandbox_enabled,
                     )
             else:
@@ -1422,24 +1569,28 @@ def handle_function_call(
                         function_name, next_args,
                         task_id=task_id,
                         session_id=session_id,
+                        tool_call_id=tool_call_id,
                         user_task=user_task,
                     )
-            if skip_tool_execution_middleware:
-                result = _dispatch(function_args)
-            else:
-                from hermes_cli.middleware import run_tool_execution_middleware
+            try:
+                if skip_tool_execution_middleware:
+                    result = _dispatch(function_args)
+                else:
+                    from hermes_cli.middleware import run_tool_execution_middleware
 
-                result = run_tool_execution_middleware(
-                    function_name,
-                    function_args,
-                    _dispatch,
-                    original_args=_tool_original_args,
-                    task_id=task_id or "",
-                    session_id=session_id or "",
-                    tool_call_id=tool_call_id or "",
-                    turn_id=turn_id or "",
-                    api_request_id=api_request_id or "",
-                )
+                    result = run_tool_execution_middleware(
+                        function_name,
+                        function_args,
+                        _dispatch,
+                        original_args=_tool_original_args,
+                        task_id=task_id or "",
+                        session_id=session_id or "",
+                        tool_call_id=tool_call_id or "",
+                        turn_id=turn_id or "",
+                        api_request_id=api_request_id or "",
+                    )
+            finally:
+                _reset_strict_approval_token()
         finally:
             if _approval_tokens is not None and reset_current_observability_context is not None:
                 try:

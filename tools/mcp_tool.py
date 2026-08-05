@@ -1767,7 +1767,14 @@ class ElicitationHandler:
         captured = getattr(self.owner, "_pending_call_context", None) if self.owner else None
 
         def _invoke_consent() -> str:
+            # ``captured`` can contain the parent's one-use strict approval
+            # marker. Elicitation is a separate consent interaction, not the
+            # approved MCP tool execution, so it must never inherit that
+            # marker into the worker thread or a subsequent callback.
+            from tools.strict_approval import clear_inherited_authorization_context
+
             if captured is None:
+                clear_inherited_authorization_context()
                 return request_elicitation_consent(
                     message,
                     description,
@@ -1776,13 +1783,16 @@ class ElicitationHandler:
                 )
             # Context.run can only execute a context once — copy to allow
             # multiple elicitations within a single tool call.
-            return captured.copy().run(
-                request_elicitation_consent,
-                message,
-                description,
-                timeout_seconds=int(self.timeout),
-                surface=f"mcp-elicitation/{self.server_name}",
-            )
+            def _run_in_clean_context() -> str:
+                clear_inherited_authorization_context()
+                return request_elicitation_consent(
+                    message,
+                    description,
+                    timeout_seconds=int(self.timeout),
+                    surface=f"mcp-elicitation/{self.server_name}",
+                )
+
+            return captured.copy().run(_run_in_clean_context)
 
         try:
             answer = await asyncio.wait_for(

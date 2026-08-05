@@ -1979,6 +1979,21 @@ def _run_single_child(
     Run a pre-built child agent. Called from within a thread.
     Returns a structured result dict.
     """
+    # ``copy_context`` propagates the parent's session identity (which the
+    # child needs for its own Telegram approvals), but it must not propagate
+    # the parent's one-shot execution proof.  This is also called in the
+    # synchronous single-child path, where no worker boundary would otherwise
+    # clear it.
+    try:
+        from tools.strict_approval import clear_inherited_authorization_context
+
+        clear_inherited_authorization_context()
+    except Exception:
+        logger.error(
+            "Could not clear inherited strict-approval context; blocking child",
+            exc_info=True,
+        )
+        raise
     child_start = time.monotonic()
 
     # Get the progress callback from the child agent
@@ -3005,9 +3020,17 @@ def delegate_task(
         waits on each other, and returns together.
         """
         if n_tasks == 1:
-            # Single task -- run directly (no thread pool overhead)
+            # Single task -- keep the parent context intact while the child
+            # runs with its own clean execution-only approval context.
             _i, _t, child = children[0]
-            result = _run_single_child(_i, _t["goal"], child, parent_agent)
+            child_context = contextvars.copy_context()
+            result = child_context.run(
+                _run_single_child,
+                _i,
+                _t["goal"],
+                child,
+                parent_agent,
+            )
             results.append(result)
         else:
             # Batch -- run in parallel with per-task progress lines

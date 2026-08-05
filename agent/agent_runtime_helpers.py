@@ -2800,12 +2800,12 @@ def switch_model(agent, new_model, new_provider, api_key='', base_url='', api_mo
             )
 
 
-def invoke_tool(agent, function_name: str, function_args: dict, effective_task_id: str,
-                 tool_call_id: Optional[str] = None, messages: list = None,
-                 pre_tool_block_checked: bool = False,
-                 skip_tool_request_middleware: bool = False,
-                 tool_request_middleware_trace: Optional[List[Dict[str, Any]]] = None,
-                 skip_tool_execution_middleware: bool = False) -> str:
+def _invoke_tool_unchecked(agent, function_name: str, function_args: dict, effective_task_id: str,
+                           tool_call_id: Optional[str] = None, messages: list = None,
+                           pre_tool_block_checked: bool = False,
+                           skip_tool_request_middleware: bool = False,
+                           tool_request_middleware_trace: Optional[List[Dict[str, Any]]] = None,
+                           skip_tool_execution_middleware: bool = False) -> str:
     """Invoke a single tool and return the result string. No display logic.
 
     Handles both agent-level tools (todo, memory, etc.) and registry-dispatched
@@ -2939,6 +2939,9 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
                 old_text=next_args.get("old_text"),
                 operations=operations,
                 store=agent._memory_store,
+                _approval_args=dict(next_args),
+                _tool_call_id=tool_call_id,
+                _session_id=getattr(agent, "session_id", ""),
             )
             # Mirror successful built-in memory writes to external providers.
             # All gating/op-expansion lives behind the manager interface
@@ -3005,15 +3008,82 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
                 **dispatch_kwargs,
             )
 
+    _direct_dispatch_lock = threading.Lock()
+    _direct_dispatched = False
+
+    def _execute_with_strict_exact_args(next_args: dict) -> Any:
+        """Keep the legacy/direct special sinks bound to approved arguments."""
+        nonlocal _direct_dispatched
+        with _direct_dispatch_lock:
+            if _direct_dispatched:
+                raise RuntimeError("direct tool execution callback invoked more than once")
+            _direct_dispatched = True
+        final_args = next_args if isinstance(next_args, dict) else function_args
+        fresh_strict_token = None
+        try:
+            from tools.strict_approval import (
+                clear_inherited_authorization_context,
+                enter_authorized_call,
+                is_authorized_call,
+                require_tool_approval,
+                reset_authorized_call,
+                strict_mode_enabled,
+            )
+
+            if strict_mode_enabled() and not is_authorized_call(
+                function_name,
+                final_args,
+                tool_call_id=tool_call_id or "",
+            ):
+                # Execution middleware is allowed to rewrite payloads for
+                # legacy modes, but such a rewrite is a new exact tool call in
+                # every_tool.  The old approval proof is cleared before asking
+                # again, so special sinks cannot run the rewritten payload.
+                clear_inherited_authorization_context()
+                invocation = require_tool_approval(
+                    function_name,
+                    final_args,
+                    tool_call_id=tool_call_id or "",
+                    session_id=getattr(agent, "session_id", "") or "",
+                    conversation_id=getattr(agent, "session_id", "") or "",
+                )
+                if invocation is None:
+                    raise RuntimeError("strict direct tool approval was not obtained")
+                final_args = invocation.args
+                fresh_strict_token = enter_authorized_call(invocation)
+            return _execute(final_args)
+        except Exception as strict_error:
+            try:
+                if strict_mode_enabled():
+                    return json.dumps(
+                        {"error": f"Global approval blocked: {strict_error}"},
+                        ensure_ascii=False,
+                    )
+            except Exception:
+                return json.dumps(
+                    {"error": "Global approval blocked: security subsystem unavailable"},
+                    ensure_ascii=False,
+                )
+            raise
+        finally:
+            if fresh_strict_token is not None:
+                try:
+                    reset_authorized_call(fresh_strict_token)
+                except Exception:
+                    logger.error(
+                        "Failed to reset strict direct approval context",
+                        exc_info=True,
+                    )
+
     if skip_tool_execution_middleware:
-        return _execute(function_args)
+        return _execute_with_strict_exact_args(function_args)
 
     from hermes_cli.middleware import run_tool_execution_middleware
 
     return run_tool_execution_middleware(
         function_name,
         function_args,
-        lambda next_args: _execute(next_args if isinstance(next_args, dict) else function_args),
+        _execute_with_strict_exact_args,
         original_args=function_args,
         task_id=effective_task_id or "",
         session_id=getattr(agent, "session_id", "") or "",
@@ -3021,6 +3091,109 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
         turn_id=getattr(agent, "_current_turn_id", "") or "",
         api_request_id=getattr(agent, "_current_api_request_id", "") or "",
     )
+
+
+def invoke_tool(agent, function_name: str, function_args: dict, effective_task_id: str,
+                tool_call_id: Optional[str] = None, messages: list = None,
+                pre_tool_block_checked: bool = False,
+                skip_tool_request_middleware: bool = False,
+                tool_request_middleware_trace: Optional[List[Dict[str, Any]]] = None,
+                skip_tool_execution_middleware: bool = False) -> str:
+    """Gate the legacy/direct agent invocation path before its special sinks.
+
+    ``agent.tool_executor`` is the primary path, but concurrent and compatibility
+    callers still arrive here. Request middleware is applied first so the
+    approval covers the exact effective payload; the unchecked body then runs
+    under a one-use marker and the marker is reset even when a special branch
+    returns early or raises.
+    """
+    if not isinstance(function_args, dict):
+        function_args = {}
+    middleware_trace = list(tool_request_middleware_trace or [])
+    if not skip_tool_request_middleware:
+        try:
+            from hermes_cli.middleware import apply_tool_request_middleware
+
+            request_result = apply_tool_request_middleware(
+                function_name,
+                function_args,
+                task_id=effective_task_id or "",
+                session_id=getattr(agent, "session_id", "") or "",
+                tool_call_id=tool_call_id or "",
+                turn_id=getattr(agent, "_current_turn_id", "") or "",
+                api_request_id=getattr(agent, "_current_api_request_id", "") or "",
+            )
+            function_args = request_result.payload
+            middleware_trace = request_result.trace
+        except Exception as middleware_error:
+            logger.debug("tool_request middleware error: %s", middleware_error)
+
+    strict_token = None
+    effective_tool_call_id = str(tool_call_id or "")
+    try:
+        try:
+            from tools.strict_approval import (
+                authorized_call_id,
+                clear_inherited_authorization_context,
+                enter_authorized_call,
+                is_authorized_call,
+                require_tool_approval,
+                reset_authorized_call,
+            )
+
+            if not is_authorized_call(
+                function_name,
+                function_args,
+                tool_call_id=tool_call_id or "",
+            ):
+                clear_inherited_authorization_context()
+                invocation = require_tool_approval(
+                    function_name,
+                    function_args,
+                    tool_call_id=tool_call_id or "",
+                    session_id=getattr(agent, "session_id", "") or "",
+                    conversation_id=getattr(agent, "session_id", "") or "",
+                )
+                if invocation is not None:
+                    function_args = invocation.args
+                    effective_tool_call_id = invocation.tool_call_id
+                    strict_token = enter_authorized_call(invocation)
+            elif not effective_tool_call_id:
+                effective_tool_call_id = authorized_call_id()
+        except Exception as strict_error:
+            try:
+                from tools.strict_approval import strict_mode_enabled
+
+                if strict_mode_enabled():
+                    return json.dumps(
+                        {"error": f"Global approval blocked: {strict_error}"},
+                        ensure_ascii=False,
+                    )
+            except Exception:
+                return json.dumps(
+                    {"error": "Global approval blocked: security subsystem unavailable"},
+                    ensure_ascii=False,
+                )
+            raise
+
+        return _invoke_tool_unchecked(
+            agent,
+            function_name,
+            function_args,
+            effective_task_id,
+            tool_call_id=effective_tool_call_id,
+            messages=messages,
+            pre_tool_block_checked=pre_tool_block_checked,
+            skip_tool_request_middleware=True,
+            tool_request_middleware_trace=middleware_trace,
+            skip_tool_execution_middleware=skip_tool_execution_middleware,
+        )
+    finally:
+        if strict_token is not None:
+            try:
+                reset_authorized_call(strict_token)
+            except Exception:
+                logger.error("Failed to reset strict approval context", exc_info=True)
 
 
 

@@ -962,8 +962,8 @@ _SCHEMA_OVERRIDES: Dict[str, Dict[str, Any]] = {
     },
     "approvals.mode": {
         "type": "select",
-        "description": "Dangerous command approval mode",
-        "options": ["manual", "smart", "off"],
+        "description": "Global tool approval mode",
+        "options": ["every_tool", "manual", "smart", "off"],
     },
     "context.engine": {
         "type": "select",

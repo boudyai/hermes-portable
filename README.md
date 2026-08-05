@@ -24,7 +24,7 @@ Use any model you want — [Nous Portal](https://portal.nousresearch.com), OpenR
 <tr><td><b>A real terminal interface</b></td><td>Full TUI with multiline editing, slash-command autocomplete, conversation history, interrupt-and-redirect, and streaming tool output.</td></tr>
 <tr><td><b>Lives where you do</b></td><td>Telegram, Discord, Slack, WhatsApp, Signal, and CLI — all from a single gateway process. Voice memo transcription, cross-platform conversation continuity.</td></tr>
 <tr><td><b>A closed learning loop</b></td><td>Agent-curated memory with periodic nudges. Autonomous skill creation after complex tasks. Skills self-improve during use. FTS5 session search with LLM summarization for cross-session recall. <a href="https://github.com/plastic-labs/honcho">Honcho</a> dialectic user modeling. Compatible with the <a href="https://agentskills.io">agentskills.io</a> open standard.</td></tr>
-<tr><td><b>Scheduled automations</b></td><td>Built-in cron scheduler with delivery to any platform. Daily reports, nightly backups, weekly audits — all in natural language, running unattended.</td></tr>
+<tr><td><b>Scheduled automations</b></td><td>Built-in cron scheduler with delivery to any platform. In the strict operations profile, every scheduled run receives a fresh Telegram approval before it can execute.</td></tr>
 <tr><td><b>Delegates and parallelizes</b></td><td>Spawn isolated subagents for parallel workstreams. Write Python scripts that call tools via RPC, collapsing multi-step pipelines into zero-context-cost turns.</td></tr>
 <tr><td><b>Runs anywhere, not just your laptop</b></td><td>Seven terminal backends — local, Docker, SSH, Singularity, Modal, Daytona, and Vercel Sandbox. Daytona and Modal offer serverless persistence — your agent's environment hibernates when idle and wakes on demand, costing nearly nothing between sessions. Run it on a $5 VPS or a GPU cluster.</td></tr>
 <tr><td><b>Research-ready</b></td><td>Batch trajectory generation, trajectory compression for training the next generation of tool-calling models.</td></tr>
@@ -118,6 +118,68 @@ hermes doctor       # Diagnose any issues
 ```
 
 📖 **[Full documentation →](https://hermes-agent.nousresearch.com/docs/)**
+
+---
+
+## Global Tool Approval
+
+New installations use the `ops` toolset and strict `every_tool` approval by
+default. Every model-generated tool call — including harmless reads — waits
+for a one-time approval in the bound Telegram chat before execution. The
+approval UI has exactly two actions: **Allow Once** and **Deny**.
+
+Strict mode does not use regular-expression danger rules, model risk scoring,
+memory rules, session approvals, or permanent approvals. It fails closed when
+Telegram is unavailable, approval state is damaged, a callback comes from the
+wrong user or chat, arguments change, or the request expires.
+
+The approval record binds the tool name, canonical JSON arguments, SHA-256
+hash, tool-call ID, session, conversation, Telegram user/chat, and expiration.
+Pending state is persisted with locking and integrity protection; audit output
+redacts API keys, passwords, bearer tokens, cookies, private keys, database
+URLs, and other credentials. Retries and nested tool calls require a new
+approval.
+
+The default configuration is:
+
+```yaml
+toolsets:
+  - ops
+
+approvals:
+  mode: every_tool
+  timeout_seconds: 300
+  allow_session_approval: false
+  allow_permanent_approval: false
+
+wiki:
+  enabled: true
+  root: ~/.hermes/wiki
+```
+
+The `ops` profile includes terminal, files, code execution, browser/web,
+HTTP, skills, memory, session search, delegation, cron, MCP, and the operator
+wiki. Third-party messaging and creative/media tools remain opt-in.
+
+Cron management actions require approval, and every actual scheduled run
+requires a fresh approval. A denied, expired, or unavailable approval pauses
+the job; restarting Hermes never resumes a pending action automatically.
+
+Set up Telegram and start the gateway with:
+
+```bash
+hermes gateway setup
+hermes gateway start
+```
+
+For a local checkout, the equivalent development command is:
+
+```bash
+uv run hermes gateway
+```
+
+In strict mode, non-Telegram execution surfaces fail closed unless they are
+already running inside a Telegram-bound approved tool call.
 
 ---
 

@@ -62,12 +62,46 @@ def substitute_template_vars(
     return _SKILL_TEMPLATE_RE.sub(_replace, content)
 
 
-def run_inline_shell(command: str, cwd: Path | None, timeout: int) -> str:
+def run_inline_shell(
+    command: str,
+    cwd: Path | None,
+    timeout: int,
+    *,
+    session_id: str | None = None,
+) -> str:
     """Execute a single inline-shell snippet and return its stdout (trimmed).
 
     Failures return a short ``[inline-shell error: ...]`` marker instead of
     raising, so one bad snippet can't wreck the whole skill message.
     """
+    # Inline shell is a real execution sink even though it is embedded in a
+    # SKILL.md document rather than exposed as a normal model tool. In strict
+    # mode it gets its own immutable approval; otherwise a skill could bypass
+    # the dispatcher by placing ``!`...``` in prose.
+    try:
+        from tools.strict_approval import require_tool_approval, strict_mode_enabled
+
+        if strict_mode_enabled():
+            invocation = require_tool_approval(
+                "skill.inline_shell",
+                {"command": command, "cwd": str(cwd) if cwd else "", "timeout": int(timeout)},
+                session_id=str(session_id or ""),
+                conversation_id=str(session_id or ""),
+            )
+            if invocation is None:
+                return "[inline-shell blocked: strict approval unavailable]"
+            command = str(invocation.args.get("command", ""))
+            cwd = Path(str(invocation.args.get("cwd"))) if invocation.args.get("cwd") else None
+            timeout = int(invocation.args.get("timeout", timeout))
+    except Exception as exc:
+        try:
+            from tools.strict_approval import strict_mode_enabled
+
+            if strict_mode_enabled():
+                return "[inline-shell blocked: approval subsystem unavailable or call denied]"
+        except Exception:
+            return "[inline-shell blocked: security subsystem unavailable]"
+
     _popen_kwargs = {"creationflags": windows_hide_flags()} if IS_WINDOWS else {}
     try:
         completed = subprocess.run(
@@ -107,6 +141,8 @@ def expand_inline_shell(
     content: str,
     skill_dir: Path | None,
     timeout: int,
+    *,
+    session_id: str | None = None,
 ) -> str:
     """Replace every !`cmd` snippet in ``content`` with its stdout.
 
@@ -120,7 +156,7 @@ def expand_inline_shell(
         cmd = match.group(1).strip()
         if not cmd:
             return ""
-        return run_inline_shell(cmd, skill_dir, timeout)
+        return run_inline_shell(cmd, skill_dir, timeout, session_id=session_id)
 
     return _INLINE_SHELL_RE.sub(_replace, content)
 
@@ -140,5 +176,10 @@ def preprocess_skill_content(
         content = substitute_template_vars(content, skill_dir, session_id)
     if cfg.get("inline_shell", False):
         timeout = int(cfg.get("inline_shell_timeout", 10) or 10)
-        content = expand_inline_shell(content, skill_dir, timeout)
+        content = expand_inline_shell(
+            content,
+            skill_dir,
+            timeout,
+            session_id=session_id,
+        )
     return content
