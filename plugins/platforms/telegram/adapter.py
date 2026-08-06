@@ -25,6 +25,46 @@ from typing import Dict, List, Optional, Set, Any
 logger = logging.getLogger(__name__)
 
 
+def _format_strict_approval_args(args: Any) -> str:
+    """Format redacted tool arguments for humans, preserving multiline text.
+
+    Canonical JSON remains the approval/execution format.  This formatter is
+    display-only: JSON string escaping makes wiki pages, patches, prompts, and
+    skill bodies appear as one wall of literal ``\\n`` sequences in Telegram.
+    Keep compact scalar fields together and move multiline/structured values
+    into clearly separated blocks.
+    """
+    if isinstance(args, str):
+        return args
+    if not isinstance(args, dict):
+        return json.dumps(args, ensure_ascii=False, indent=2, sort_keys=True)
+
+    inline_fields: List[str] = []
+    block_fields: List[str] = []
+    for raw_key in sorted(args, key=lambda item: str(item)):
+        key = str(raw_key)
+        value = args[raw_key]
+        if isinstance(value, str):
+            if "\n" in value:
+                block_fields.append(f"{key}:\n{value.rstrip()}")
+            else:
+                display_value = value if value else '""'
+                inline_fields.append(f"{key}: {display_value}")
+            continue
+
+        rendered = json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True)
+        if "\n" in rendered:
+            block_fields.append(f"{key}:\n{rendered}")
+        else:
+            inline_fields.append(f"{key}: {rendered}")
+
+    sections: List[str] = []
+    if inline_fields:
+        sections.append("\n".join(inline_fields))
+    sections.extend(block_fields)
+    return "\n\n".join(sections)
+
+
 def _redact_telegram_error_text(error: object) -> str:
     """Redact secrets from Telegram transport errors before logging or returning them."""
     text = "" if error is None else str(error)
@@ -5532,10 +5572,7 @@ class TelegramAdapter(BasePlatformAdapter):
 
             tool_name = _html.escape(str(approval.get("tool_name", "")))
             args = redact_for_display(approval.get("args", "[REDACTED]"))
-            if isinstance(args, str):
-                args_display = args
-            else:
-                args_display = json.dumps(args, ensure_ascii=False, indent=2, sort_keys=True)
+            args_display = _format_strict_approval_args(args)
             expires = _html.escape(format_telegram_expiration(float(approval["expires_at"])))
 
             def render_prompt(display_args: str) -> str:

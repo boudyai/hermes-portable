@@ -268,6 +268,54 @@ class TestTelegramStrictToolApproval:
         assert "аргументы сокращены; полный payload сохранён" in sent["text"]
         assert content not in sent["text"]
 
+    @pytest.mark.asyncio
+    async def test_multiline_arguments_render_as_readable_blocks(self):
+        adapter = _make_adapter()
+        sent = {}
+
+        async def capture_send(**kwargs):
+            sent.update(kwargs)
+            return SimpleNamespace(message_id=44)
+
+        adapter._bot.send_message = AsyncMock(side_effect=capture_send)
+        content = (
+            "---\n"
+            "name: homelab-operations\n"
+            "description: Read the operator wiki first.\n"
+            "---\n\n"
+            "# Homelab operations\n\n"
+            "Read `/root/wiki/index.md` before acting."
+        )
+        result = await adapter.send_strict_tool_approval(
+            approval={
+                "approval_id": "approval-multiline",
+                "tool_name": "skill_manage",
+                "args": {
+                    "action": "create",
+                    "category": "infrastructure",
+                    "content": content,
+                    "name": "homelab-operations",
+                },
+                "expires_at": time.time() + 900,
+                "telegram_chat_id": "12345",
+            }
+        )
+
+        assert result.success is True
+        assert (
+            "action: create\n"
+            "category: infrastructure\n"
+            "name: homelab-operations\n\n"
+            "content:\n"
+            "---\n"
+            "name: homelab-operations\n"
+            "description: Read the operator wiki first.\n"
+            "---\n\n"
+            "# Homelab operations"
+        ) in sent["text"]
+        assert "\\nname: homelab-operations\\n" not in sent["text"]
+        assert utf16_len(sent["text"]) <= adapter.MAX_MESSAGE_LENGTH
+
 # _handle_callback_query — approval button clicks
 # ===========================================================================
 
