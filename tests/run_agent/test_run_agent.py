@@ -49,6 +49,25 @@ def _make_tool_defs(*names: str) -> list:
     ]
 
 
+def _approve_exact_tool_call(tool_name, args, *, tool_call_id="", **_kwargs):
+    """Return the immutable invocation produced by a successful strict approval."""
+    from tools.strict_approval import (
+        ApprovedInvocation,
+        arguments_hash,
+        canonical_json,
+    )
+
+    canonical_args = canonical_json(args)
+    return ApprovedInvocation(
+        approval_id=f"approval-{tool_call_id}",
+        tool_call_id=tool_call_id,
+        tool_name=tool_name,
+        canonical_args=canonical_args,
+        args_hash=arguments_hash(tool_name, canonical_args),
+        args=dict(args),
+    )
+
+
 def test_is_destructive_command_treats_cp_as_mutating():
     assert run_agent._is_destructive_command("cp .env.local .env") is True
 
@@ -1511,13 +1530,32 @@ class TestExecuteToolCalls:
         tool_results = [m for m in messages if m["role"] == "tool"]
         assert [m["tool_call_id"] for m in tool_results] == ["c1", "c2"]
 
-    def test_sequential_memory_remove_notifies_provider_with_tool_result(self, agent):
+    @pytest.mark.parametrize("tool_name", ["skills_list", "skill_view", "skill_manage"])
+    def test_approved_skill_tools_preserve_tool_call_id(self, agent, tool_name):
+        tc = _mock_tool_call(name=tool_name, arguments="{}", call_id="skill-1")
+        mock_msg = _mock_assistant_msg(content="", tool_calls=[tc])
+        messages = []
+
+        with (
+            patch(
+                "tools.strict_approval.require_tool_approval",
+                side_effect=_approve_exact_tool_call,
+            ),
+            patch("run_agent.handle_function_call", return_value="ok") as dispatch,
+        ):
+            agent._execute_tool_calls_sequential(mock_msg, messages, "task-1")
+
+        assert dispatch.call_args.kwargs["tool_call_id"] == "skill-1"
+        assert messages[-1]["tool_call_id"] == "skill-1"
+
+    @pytest.mark.parametrize("target", ["memory", "user"])
+    def test_sequential_memory_remove_notifies_provider_with_tool_result(self, agent, target):
         old_text = "stale preference entry"
         tc = _mock_tool_call(
             name="memory",
             arguments=json.dumps({
                 "action": "remove",
-                "target": "memory",
+                "target": target,
                 "old_text": old_text,
             }),
             call_id="mem-1",
@@ -1536,12 +1574,22 @@ class TestExecuteToolCalls:
         agent._memory_manager = FakeMemoryManager()
         agent._memory_store = object()
 
-        with patch("tools.memory_tool.memory_tool", return_value=json.dumps({"success": True})):
+        with (
+            patch(
+                "tools.strict_approval.require_tool_approval",
+                side_effect=_approve_exact_tool_call,
+            ),
+            patch(
+                "tools.memory_tool.memory_tool",
+                return_value=json.dumps({"success": True}),
+            ) as memory_tool,
+        ):
             agent._execute_tool_calls_sequential(mock_msg, messages, "task-1")
 
+        assert memory_tool.call_args.kwargs["_tool_call_id"] == "mem-1"
         assert len(calls) == 1
-        action, target, content, metadata = calls[0]
-        assert (action, target, content) == ("remove", "memory", "")
+        action, recorded_target, content, metadata = calls[0]
+        assert (action, recorded_target, content) == ("remove", target, "")
         assert metadata["old_text"] == old_text
         assert metadata["tool_call_id"] == "mem-1"
         assert messages[-1]["tool_call_id"] == "mem-1"

@@ -1809,7 +1809,7 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                     operations=operations,
                     store=agent._memory_store,
                     _approval_args=dict(next_args),
-                    _tool_call_id=tool_call_id,
+                    _tool_call_id=getattr(tool_call, "id", "") or "",
                     _session_id=getattr(agent, "session_id", ""),
                 )
                 # Mirror successful built-in memory writes to external
