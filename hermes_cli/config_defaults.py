@@ -613,10 +613,10 @@ DEFAULT_CONFIG = {
                                       # itself be re-summarized.
         "proactive_prune_min_reclaim_tokens": 4096,  # a proactive prune only commits
                                       # when it reclaims at least this many tokens
-                                      # (measured on the pruned output). Keeps
-                                      # prompt-cache invalidation amortized: one big
-                                      # episodic break instead of a tiny break every
-                                      # tool iteration. 0 = commit any non-zero prune.
+                                      # (measured on the pruned output), then waits
+                                      # for a full trigger-sized token runway to
+                                      # regrow before rearming. Keeps prompt-cache
+                                      # breaks episodic. 0 = no minimum-savings gate.
         "micro_compact": False,       # opt-in: after each completed turn, fold the
                                       # oldest un-absorbed exchange into a rolling
                                       # summary, amortizing compression cost instead
@@ -1580,6 +1580,7 @@ DEFAULT_CONFIG = {
         "enabled": False,
         "surface": "auto",            # eligible surface: "auto" (first claimant) | "cli" | "tui" | "gui"
         "input_device": None,          # PortAudio input device index/name; null uses the process default
+        "capture": "auto",            # auto | local | client — where PCM is captured (client = desktop streams mic via wake.feed)
         "provider": "openwakeword",   # "openwakeword" (free, local) | "sherpa" (free, ANY phrase, no training) | "porcupine" (premium; needs PORCUPINE_ACCESS_KEY)
         "phrase": "hey hermes",       # for "sherpa" this IS the detected phrase (any text works); for other engines it's a cosmetic label — detection is keyed by the model/keyword below
         "sensitivity": 0.6,           # 0.0-1.0 detection threshold, consistent across engines (higher = stricter, fewer false triggers)
@@ -2043,14 +2044,15 @@ DEFAULT_CONFIG = {
     # timeout — seconds to wait for the user's approve/deny before failing
     # closed (deny). Shared by the CLI prompt and gateway/messaging waits.
     # Messaging approvals arrive as a push notification the user may not see
-    # immediately — 60s proved too tight on Telegram/Discord (the prompt
-    # expired before the user reached their phone), so the default is 300.
+    # immediately — shorter waits proved too tight on Telegram/Discord (the
+    # prompt expired before the user reached their phone), so the strict ops
+    # default is 15 minutes.
     "approvals": {
         "mode": "every_tool",
-        "timeout": 300,
+        "timeout": 900,
         # Strict global mode: every tool call waits for one Telegram decision.
         # The legacy keys above remain for manual/smart/off compatibility.
-        "timeout_seconds": 300,
+        "timeout_seconds": 900,
         "allow_session_approval": False,
         "allow_permanent_approval": False,
         "cron_mode": "deny",
@@ -2103,7 +2105,7 @@ DEFAULT_CONFIG = {
         "wiki_enabled": True,
         "approvals": {
             "mode": "every_tool",
-            "timeout_seconds": 300,
+            "timeout_seconds": 900,
             "allow_session_approval": False,
             "allow_permanent_approval": False,
         },
@@ -3356,6 +3358,22 @@ OPTIONAL_ENV_VARS = {
     "GMI_BASE_URL": {
         "description": "GMI Cloud base URL override",
         "prompt": "GMI Cloud base URL (leave empty for default)",
+        "url": None,
+        "password": False,
+        "category": "provider",
+        "advanced": True,
+    },
+    "ACTUAL_API_KEY": {
+        "description": "Actual Computer inference key (ac_...)",
+        "prompt": "Actual Computer inference key",
+        "url": "https://actual.inc/user/keys",
+        "password": True,
+        "category": "provider",
+        "advanced": True,
+    },
+    "ACTUAL_BASE_URL": {
+        "description": "Actual Computer base URL override (set to http://127.0.0.1:8080 for the local offline daemon)",
+        "prompt": "Actual Computer base URL (leave empty for hosted relay)",
         "url": None,
         "password": False,
         "category": "provider",

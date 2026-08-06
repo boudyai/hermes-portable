@@ -53,7 +53,7 @@ toolsets:
 
 approvals:
   mode: every_tool
-  timeout_seconds: 300
+  timeout_seconds: 900
   allow_session_approval: false
   allow_permanent_approval: false
 

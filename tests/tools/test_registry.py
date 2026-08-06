@@ -6,7 +6,18 @@ import threading
 from pathlib import Path
 from unittest.mock import patch
 
+import pytest
+
 from tools.registry import ToolRegistry, _module_registers_tools, discover_builtin_tools
+
+
+@pytest.fixture(autouse=True)
+def _exercise_registry_behavior_below_strict_gate(monkeypatch):
+    """Keep generic registry tests below the global approval boundary."""
+    monkeypatch.setattr(
+        "tools.strict_approval._strict_config",
+        lambda: (False, 0.0),
+    )
 
 
 def _dummy_handler(args, **kwargs):

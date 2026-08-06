@@ -9,6 +9,17 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
+
+
+@pytest.fixture(autouse=True)
+def _exercise_legacy_execution_ledger(monkeypatch):
+    """Keep ledger transition tests below the strict scheduled-run boundary."""
+    monkeypatch.setattr(
+        "tools.strict_approval._strict_config",
+        lambda: (False, 0.0),
+    )
+
 
 def _point_ledger(monkeypatch, tmp_path):
     import cron.executions as executions

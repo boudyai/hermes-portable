@@ -49,6 +49,7 @@ _ensure_telegram_mock()
 
 from plugins.platforms.telegram.adapter import TelegramAdapter
 from gateway.config import Platform, PlatformConfig
+from gateway.platforms.base import utf16_len
 
 
 def _make_adapter(extra=None):
@@ -240,6 +241,32 @@ class TestTelegramStrictToolApproval:
             ("🦀", "ga:d:approval-123"),
         ]
         assert captured_rows == [buttons]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("content", ["x" * 5400, "🧱" * 3000])
+    async def test_long_arguments_fit_telegram_utf16_limit(self, content):
+        adapter = _make_adapter()
+        sent = {}
+
+        async def capture_send(**kwargs):
+            sent.update(kwargs)
+            return SimpleNamespace(message_id=43)
+
+        adapter._bot.send_message = AsyncMock(side_effect=capture_send)
+        result = await adapter.send_strict_tool_approval(
+            approval={
+                "approval_id": "approval-long",
+                "tool_name": "write_file",
+                "args": {"path": "/root/wiki/codeserver.md", "content": content},
+                "expires_at": time.time() + 900,
+                "telegram_chat_id": "12345",
+            }
+        )
+
+        assert result.success is True
+        assert utf16_len(sent["text"]) <= adapter.MAX_MESSAGE_LENGTH
+        assert "аргументы сокращены; полный payload сохранён" in sent["text"]
+        assert content not in sent["text"]
 
 # _handle_callback_query — approval button clicks
 # ===========================================================================

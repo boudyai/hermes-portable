@@ -5533,17 +5533,33 @@ class TelegramAdapter(BasePlatformAdapter):
             tool_name = _html.escape(str(approval.get("tool_name", "")))
             args = redact_for_display(approval.get("args", "[REDACTED]"))
             if isinstance(args, str):
-                args_text = args
+                args_display = args
             else:
-                args_text = json.dumps(args, ensure_ascii=False, indent=2, sort_keys=True)
-            args_text = _html.escape(args_text[:7000])
+                args_display = json.dumps(args, ensure_ascii=False, indent=2, sort_keys=True)
             expires = _html.escape(format_telegram_expiration(float(approval["expires_at"])))
-            text = (
-                "🔐 <b>Подтверждение tool call</b>\n\n"
-                f"<b>Инструмент:</b> <code>{tool_name}</code>\n"
-                f"<b>Аргументы:</b>\n<pre>{args_text}</pre>\n"
-                f"<b>Истекает:</b> {expires}"
-            )
+
+            def render_prompt(display_args: str) -> str:
+                return (
+                    "🔐 <b>Подтверждение tool call</b>\n\n"
+                    f"<b>Инструмент:</b> <code>{tool_name}</code>\n"
+                    f"<b>Аргументы:</b>\n<pre>{_html.escape(display_args)}</pre>\n"
+                    f"<b>Истекает:</b> {expires}"
+                )
+
+            text = render_prompt(args_display)
+            if utf16_len(text) > self.MAX_MESSAGE_LENGTH:
+                truncation_marker = (
+                    "\n… [аргументы сокращены; полный payload сохранён]"
+                )
+                lo, hi = 0, len(args_display)
+                while lo < hi:
+                    mid = (lo + hi + 1) // 2
+                    candidate = args_display[:mid] + truncation_marker
+                    if utf16_len(render_prompt(candidate)) <= self.MAX_MESSAGE_LENGTH:
+                        lo = mid
+                    else:
+                        hi = mid - 1
+                text = render_prompt(args_display[:lo] + truncation_marker)
             approval_id = str(approval["approval_id"])
             keyboard = InlineKeyboardMarkup([
                 [

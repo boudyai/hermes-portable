@@ -19,6 +19,20 @@ from tui_gateway import server
 
 
 @pytest.fixture(autouse=True)
+def _exercise_legacy_tui_rpc_behavior(monkeypatch):
+    """Exercise TUI RPC behavior below the strict global dispatcher gate.
+
+    These tests call RPC handlers directly without a Telegram-bound approval
+    context. Strict-mode and fail-closed behavior are covered separately by
+    the global approval suite.
+    """
+    monkeypatch.setattr(
+        "tools.strict_approval._strict_config",
+        lambda: (False, 0.0),
+    )
+
+
+@pytest.fixture(autouse=True)
 def _neuter_agent_prewarm_timer(request, monkeypatch):
     """Stub the deferred agent pre-warm timer for every test in this module.
 
@@ -1473,10 +1487,15 @@ def test_wake_owner_is_sticky_and_routes_detection_to_first_transport(monkeypatc
     state = {"owner": None, "callback": None, "paused": False}
     voice_callbacks = {}
 
-    def start_listening(callback, *, owner, config):
+    def start_listening(callback, *, owner, config, external_audio=False):
         if state["owner"] is not None and state["owner"] is not owner:
             raise wake_word.WakeWordInUse
-        state.update(owner=owner, callback=callback, paused=False)
+        state.update(
+            owner=owner,
+            callback=callback,
+            paused=False,
+            external_audio=bool(external_audio),
+        )
 
     def pause_listening(*, owner):
         if state["owner"] is not owner:
@@ -1670,7 +1689,9 @@ def test_wake_toggle_persists_enabled_flag_only_on_explicit_gesture(monkeypatch)
     listener = {"owner": None}
     monkeypatch.setattr(
         wake_word, "start_listening",
-        lambda callback, *, owner, config: listener.update(owner=owner),
+        lambda callback, *, owner, config, external_audio=False: listener.update(
+            owner=owner, external_audio=bool(external_audio)
+        ),
     )
     monkeypatch.setattr(
         wake_word, "stop_listening",
@@ -2012,17 +2033,12 @@ def test_load_enabled_toolsets_rejects_disabled_mcp_env(monkeypatch, capsys):
         config_mod, "load_config", lambda: {"platform_toolsets": {"cli": ["memory"]}}
     )
 
-    # Sorted: ["kanban", "memory", "project"]. `kanban` is auto-recovered by
-    # _get_platform_tools (a non-configurable platform toolset in hermes-cli's
-    # universe); `project` is GUI-only, folded in by _load_enabled_toolsets.
-    # Toolsets inside their first release (_RECENTLY_SHIPPED_TOOLSETS) are
-    # back-filled onto saved lists that never offered them — allow those too.
     from hermes_cli.tools_config import _RECENTLY_SHIPPED_TOOLSETS
 
     result = server._load_enabled_toolsets()
     assert result is not None
-    assert {"kanban", "memory", "project"} <= set(result)
-    assert set(result) - {"kanban", "memory", "project"} <= _RECENTLY_SHIPPED_TOOLSETS
+    assert {"memory", "project"} <= set(result)
+    assert set(result) - {"memory", "project"} <= _RECENTLY_SHIPPED_TOOLSETS
     err = capsys.readouterr().err
     assert "ignoring disabled MCP servers" in err
     assert "mcp-off" in err
@@ -2047,8 +2063,8 @@ def test_load_enabled_toolsets_falls_back_when_tui_env_invalid(monkeypatch, caps
 
     result = server._load_enabled_toolsets()
     assert result is not None
-    assert {"kanban", "memory", "project"} <= set(result)
-    assert set(result) - {"kanban", "memory", "project"} <= _RECENTLY_SHIPPED_TOOLSETS
+    assert {"memory", "project"} <= set(result)
+    assert set(result) - {"memory", "project"} <= _RECENTLY_SHIPPED_TOOLSETS
     assert "using configured CLI toolsets" in capsys.readouterr().err
 
 
@@ -8222,7 +8238,9 @@ def test_commands_catalog_filters_gateway_only_commands_and_keeps_status_visible
     assert "/status" in pairs
     assert canon["/status"] == "/status"
     assert "/approvals" in pairs
-    assert resp["result"]["sub"]["/approvals"] == ["manual", "smart", "off"]
+    assert resp["result"]["sub"]["/approvals"] == [
+        "manual", "smart", "off", "every_tool",
+    ]
 
     assert "/topic" not in pairs
     assert "/approve" not in pairs
