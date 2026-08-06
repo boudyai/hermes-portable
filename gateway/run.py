@@ -20952,19 +20952,32 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 delivered = False
                 try:
                     if exit_code == 0:
-                        await adapter.send(
+                        send_result = await adapter.send(
                             chat_id,
                             "✅ Hermes update finished.",
                             metadata=_non_conversational_metadata(metadata, platform=platform),
                         )
                     else:
-                        await adapter.send(
+                        send_result = await adapter.send(
                             chat_id,
                             "❌ Hermes update failed (exit code {}).".format(exit_code),
                             metadata=_non_conversational_metadata(metadata, platform=platform),
                         )
-                    delivered = True
-                    logger.info("Update finished (exit=%s), notified %s", exit_code, session_key)
+                    if (
+                        send_result is not None
+                        and getattr(send_result, "success", True) is False
+                    ):
+                        logger.warning(
+                            "Update final notification was not delivered: %s",
+                            getattr(send_result, "error", "send returned success=False"),
+                        )
+                    else:
+                        delivered = True
+                        logger.info(
+                            "Update finished (exit=%s), notified %s",
+                            exit_code,
+                            session_key,
+                        )
                 except Exception as e:
                     logger.warning("Update final notification failed: %s", e)
 
@@ -21197,7 +21210,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 else:
                     msg = "❌ Hermes update failed. Check the gateway logs or run `hermes update` manually for details."
                 try:
-                    await adapter.send(
+                    send_result = await adapter.send(
                         chat_id,
                         msg,
                         metadata=_non_conversational_metadata(metadata, platform=platform),
@@ -21207,6 +21220,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     # not destroy the only durable completion target. Restore
                     # the claim so the startup watcher can retry delivery.
                     logger.warning("Post-update notification send failed: %s", send_error)
+                    cleanup = False
+                    active_pending_path = pending_path
+                    claimed_path.replace(pending_path)
+                    return False
+                if (
+                    send_result is not None
+                    and getattr(send_result, "success", True) is False
+                ):
+                    logger.warning(
+                        "Post-update notification was not delivered: %s",
+                        getattr(send_result, "error", "send returned success=False"),
+                    )
                     cleanup = False
                     active_pending_path = pending_path
                     claimed_path.replace(pending_path)

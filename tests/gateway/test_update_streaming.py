@@ -16,7 +16,7 @@ from unittest.mock import patch, MagicMock, AsyncMock
 import pytest
 
 from gateway.config import Platform
-from gateway.platforms.base import MessageEvent
+from gateway.platforms.base import MessageEvent, SendResult
 from gateway.session import SessionSource
 
 
@@ -202,6 +202,38 @@ class TestWatchUpdateProgress:
         assert pending_path.exists()
         assert output_path.exists()
         assert exit_path.exists()
+
+    @pytest.mark.asyncio
+    async def test_final_notification_retries_send_result_failure(self, tmp_path):
+        """A soft adapter failure must not consume legacy completion markers."""
+        runner = _make_runner()
+        hermes_home = tmp_path / "hermes"
+        hermes_home.mkdir()
+        pending_path = hermes_home / ".update_pending.json"
+        pending_path.write_text(json.dumps({
+            "platform": "telegram",
+            "chat_id": "111",
+            "session_key": "agent:main:telegram:dm:111",
+        }))
+        exit_path = hermes_home / ".update_exit_code"
+        exit_path.write_text("0")
+        adapter = AsyncMock()
+        adapter.send.side_effect = [
+            SendResult(success=False, error="temporary failure"),
+            SendResult(success=True),
+        ]
+        runner.adapters = {Platform.TELEGRAM: adapter}
+
+        with patch("gateway.run._hermes_home", hermes_home):
+            await runner._watch_update_progress(
+                poll_interval=0.01,
+                stream_interval=0.01,
+                timeout=1.0,
+            )
+
+        assert adapter.send.await_count == 2
+        assert not pending_path.exists()
+        assert not exit_path.exists()
 
     @pytest.mark.asyncio
     async def test_streams_output_to_adapter(self, tmp_path):

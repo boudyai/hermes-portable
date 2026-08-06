@@ -12,7 +12,7 @@ from unittest.mock import patch, MagicMock, AsyncMock
 import pytest
 
 from gateway.config import Platform
-from gateway.platforms.base import MessageEvent
+from gateway.platforms.base import MessageEvent, SendResult
 from gateway.session import SessionSource
 
 
@@ -367,6 +367,37 @@ class TestSendUpdateNotification:
         # Adapter send raises
         mock_adapter = AsyncMock()
         mock_adapter.send.side_effect = RuntimeError("network error")
+        runner.adapters = {Platform.TELEGRAM: mock_adapter}
+
+        with patch("gateway.run._hermes_home", hermes_home):
+            result = await runner._send_update_notification()
+
+        assert result is False
+        assert pending_path.exists()
+        assert output_path.exists()
+        assert exit_code_path.exists()
+        assert not (hermes_home / ".update_pending.claimed.json").exists()
+
+
+    @pytest.mark.asyncio
+    async def test_preserves_markers_when_notification_returns_failure(self, tmp_path):
+        """SendResult(success=False) is a failed delivery, not a completed send."""
+        runner = _make_runner()
+        hermes_home = tmp_path / "hermes"
+        hermes_home.mkdir()
+        pending_path = hermes_home / ".update_pending.json"
+        output_path = hermes_home / ".update_output.txt"
+        exit_code_path = hermes_home / ".update_exit_code"
+        pending_path.write_text(json.dumps({
+            "platform": "telegram", "chat_id": "111", "user_id": "222",
+        }))
+        output_path.write_text("✓ Done")
+        exit_code_path.write_text("0")
+        mock_adapter = AsyncMock()
+        mock_adapter.send.return_value = SendResult(
+            success=False,
+            error="Telegram temporarily unavailable",
+        )
         runner.adapters = {Platform.TELEGRAM: mock_adapter}
 
         with patch("gateway.run._hermes_home", hermes_home):
