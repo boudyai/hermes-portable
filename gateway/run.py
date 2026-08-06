@@ -5188,10 +5188,10 @@ class TurnRunner:
                 logger.error("Failed to send approval request: %s", _e)
 
         def _strict_approval_notify_sync(approval_data: dict) -> None:
-            """Send the strict every-tool prompt with exactly two buttons.
+            """Send a strict manual prompt or an ops_guarded auto notice.
 
             There is intentionally no text fallback here: if Telegram cannot
-            render/send this prompt, the strict gate fails closed and the tool
+            render/send the event, the strict gate fails closed and the tool
             is not executed.
             """
             adapter = ctx._status_adapter

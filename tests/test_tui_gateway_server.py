@@ -8239,7 +8239,7 @@ def test_commands_catalog_filters_gateway_only_commands_and_keeps_status_visible
     assert canon["/status"] == "/status"
     assert "/approvals" in pairs
     assert resp["result"]["sub"]["/approvals"] == [
-        "manual", "smart", "off", "every_tool",
+        "manual", "smart", "off", "every_tool", "ops_guarded",
     ]
 
     assert "/topic" not in pairs

@@ -2725,9 +2725,9 @@ def _normalize_approval_mode(mode) -> str:
 
     Unknown string values (e.g. 'auto') are rejected with a warning rather than
     being silently accepted and falling through every mode check downstream.
-    Always returns one of 'manual', 'smart', 'off', or 'every_tool'.
+    Always returns one of 'manual', 'smart', 'off', 'every_tool', or 'ops_guarded'.
     """
-    _VALID_MODES = ("manual", "smart", "off", "every_tool")
+    _VALID_MODES = ("manual", "smart", "off", "every_tool", "ops_guarded")
     if isinstance(mode, bool):
         return "off" if mode is False else "manual"
     if isinstance(mode, str):

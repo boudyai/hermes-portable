@@ -20,6 +20,7 @@ def strict_env(tmp_path, monkeypatch):
     store = approval.ApprovalStore(tmp_path / "approvals.sqlite3")
     approval.set_store_for_testing(store)
     monkeypatch.setattr(approval, "_strict_config", lambda: (True, 0.5))
+    monkeypatch.setattr(approval, "_ops_guarded_auto_tools", lambda _mode: frozenset())
     monkeypatch.setattr(approval, "_session_key", lambda: "telegram:session")
     approval.register_notifier(
         "telegram:session",
@@ -475,6 +476,7 @@ def test_strict_policy_cannot_be_downgraded_by_a_live_tool_call(tmp_path, monkey
     monkeypatch.setattr(approval, "get_hermes_home", lambda: tmp_path)
     with approval._strict_latch_lock:
         approval._strict_latched_homes.discard(str(tmp_path))
+        approval._strict_latched_modes.pop(str(tmp_path), None)
     monkeypatch.setattr(
         config_module,
         "load_config_readonly",
@@ -504,6 +506,7 @@ def test_strict_policy_defaults_to_fifteen_minutes(tmp_path, monkeypatch):
     monkeypatch.setattr(approval, "get_hermes_home", lambda: tmp_path)
     with approval._strict_latch_lock:
         approval._strict_latched_homes.discard(str(tmp_path))
+        approval._strict_latched_modes.pop(str(tmp_path), None)
     monkeypatch.setattr(
         config_module,
         "load_config_readonly",
@@ -517,6 +520,104 @@ def test_strict_policy_defaults_to_fifteen_minutes(tmp_path, monkeypatch):
     )
 
     assert approval._strict_config() == (True, 900.0)
+
+
+@pytest.mark.parametrize("tool_name", sorted(approval.OPS_GUARDED_AUTO_TOOLS))
+def test_ops_guarded_tools_notify_and_return_without_waiting(
+    strict_env, monkeypatch, tool_name
+):
+    seen = {}
+    approval.unregister_notifier("telegram:session")
+    approval.register_notifier(
+        "telegram:session",
+        lambda payload: seen.update(payload) or True,
+        telegram_user_id="100",
+        telegram_chat_id="200",
+    )
+    monkeypatch.setattr(
+        approval,
+        "_ops_guarded_auto_tools",
+        lambda _mode: approval.OPS_GUARDED_AUTO_TOOLS,
+    )
+
+    invocation = approval.require_tool_approval(
+        tool_name,
+        {"value": "read-only"},
+        tool_call_id=f"auto-{tool_name}",
+        session_id="conversation-1",
+    )
+
+    assert invocation is not None
+    assert invocation.tool_call_id == f"auto-{tool_name}"
+    assert seen["auto_approved"] is True
+    assert seen["tool_name"] == tool_name
+    assert strict_env.status(seen["approval_id"]) == "approved"
+
+
+def test_ops_guarded_notification_failure_blocks_execution(strict_env, monkeypatch):
+    seen = {}
+    approval.unregister_notifier("telegram:session")
+
+    def fail_notify(payload):
+        seen.update(payload)
+        return False
+
+    approval.register_notifier(
+        "telegram:session",
+        fail_notify,
+        telegram_user_id="100",
+        telegram_chat_id="200",
+    )
+    monkeypatch.setattr(
+        approval, "_ops_guarded_auto_tools", lambda _mode: frozenset({"read_file"})
+    )
+
+    with pytest.raises(approval.StrictApprovalBlocked, match="could not be sent"):
+        approval.require_tool_approval(
+            "read_file",
+            {"path": "/tmp/demo"},
+            tool_call_id="auto-read-failed",
+            session_id="conversation-1",
+        )
+
+    assert strict_env.status(seen["approval_id"]) == "blocked"
+
+
+def test_ops_guarded_cannot_widen_auto_tools_from_config(monkeypatch):
+    from hermes_cli import config as config_module
+
+    monkeypatch.setattr(
+        config_module,
+        "load_config_readonly",
+        lambda: {
+            "approvals": {
+                "mode": "ops_guarded",
+                "auto_approve_tools": ["read_file", "terminal"],
+            }
+        },
+    )
+
+    with pytest.raises(approval.StrictApprovalBlocked, match="terminal"):
+        approval._ops_guarded_auto_tools("ops_guarded")
+
+
+def test_ops_guarded_terminal_still_requires_manual_approval(strict_env, monkeypatch):
+    monkeypatch.setattr(
+        approval,
+        "_ops_guarded_auto_tools",
+        lambda _mode: approval.OPS_GUARDED_AUTO_TOOLS,
+    )
+
+    seen, result, thread = _wait_for_prompt(None, strict_env, {"command": "true"})
+    assert seen["auto_approved"] is False
+    assert approval.resolve_approval(
+        seen["approval_id"],
+        "deny",
+        telegram_user_id="100",
+        telegram_chat_id="200",
+    )
+    thread.join(2)
+    assert "denied" in str(result["error"]).lower()
 
 
 @pytest.mark.parametrize(

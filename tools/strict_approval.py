@@ -1,4 +1,4 @@
-"""Fail-closed, per-tool Telegram approval for ``approvals.mode=every_tool``.
+"""Fail-closed, per-tool Telegram approval for strict approval modes.
 
 This module intentionally does not inspect command contents.  The decision is
 always made by the human who owns the exact Telegram chat/user binding.  The
@@ -35,7 +35,17 @@ from hermes_constants import get_hermes_home
 logger = logging.getLogger(__name__)
 
 APPROVAL_MODE = "every_tool"
+OPS_GUARDED_MODE = "ops_guarded"
 DEFAULT_TIMEOUT_SECONDS = 900
+OPS_GUARDED_AUTO_TOOLS = frozenset({
+    "clarify",
+    "read_file",
+    "search_files",
+    "session_search",
+    "skill_view",
+    "skills_list",
+    "wiki_read",
+})
 
 
 class StrictApprovalError(RuntimeError):
@@ -102,6 +112,7 @@ _waiters_lock = threading.RLock()
 _waiters: dict[str, threading.Event] = {}
 _strict_latch_lock = threading.RLock()
 _strict_latched_homes: set[str] = set()
+_strict_latched_modes: dict[str, str] = {}
 
 
 def canonical_json(args: Mapping[str, Any] | dict[str, Any]) -> str:
@@ -214,7 +225,7 @@ def _strict_config() -> tuple[bool, float]:
         if not isinstance(approvals, Mapping):
             raise StrictApprovalBlocked("approvals configuration is unavailable")
         mode = str(approvals.get("mode", "")).strip().lower()
-        if mode != APPROVAL_MODE:
+        if mode not in {APPROVAL_MODE, OPS_GUARDED_MODE}:
             # Once this process has observed the secure default for a profile,
             # a tool must not be able to edit config.yaml to ``off`` (or a
             # legacy mode) and then continue issuing unapproved calls.  An
@@ -226,7 +237,7 @@ def _strict_config() -> tuple[bool, float]:
             with _strict_latch_lock:
                 if profile_home in _strict_latched_homes:
                     raise StrictApprovalBlocked(
-                        "every_tool approval policy was weakened while the "
+                        "strict approval policy was weakened while the "
                         "process was running; restart is required"
                     )
             return False, 0.0
@@ -235,11 +246,19 @@ def _strict_config() -> tuple[bool, float]:
         if timeout <= 0 or timeout != timeout or timeout == float("inf"):
             raise StrictApprovalBlocked("approvals.timeout_seconds is invalid")
         if approvals.get("allow_session_approval", False) is not False:
-            raise StrictApprovalBlocked("session approvals are forbidden in every_tool mode")
+            raise StrictApprovalBlocked("session approvals are forbidden in strict approval modes")
         if approvals.get("allow_permanent_approval", False) is not False:
-            raise StrictApprovalBlocked("permanent approvals are forbidden in every_tool mode")
+            raise StrictApprovalBlocked("permanent approvals are forbidden in strict approval modes")
+        profile_home = str(get_hermes_home())
         with _strict_latch_lock:
-            _strict_latched_homes.add(str(get_hermes_home()))
+            previous_mode = _strict_latched_modes.get(profile_home)
+            if previous_mode == APPROVAL_MODE and mode == OPS_GUARDED_MODE:
+                raise StrictApprovalBlocked(
+                    "every_tool approval policy was weakened to ops_guarded while "
+                    "the process was running; restart is required"
+                )
+            _strict_latched_homes.add(profile_home)
+            _strict_latched_modes[profile_home] = mode
         return True, timeout
     except StrictApprovalError:
         raise
@@ -250,6 +269,43 @@ def _strict_config() -> tuple[bool, float]:
 def strict_mode_enabled() -> bool:
     enabled, _ = _strict_config()
     return enabled
+
+
+def _ops_guarded_auto_tools(expected_mode: str) -> frozenset[str]:
+    """Return the exact auto-authorization set for ``ops_guarded``.
+
+    The configurable list may narrow the built-in set but can never widen it.
+    Unknown names therefore cannot turn terminal, plugins, or MCP tools into
+    unattended execution paths through a config edit.
+    """
+
+    try:
+        from hermes_cli.config import load_config_readonly
+
+        cfg = load_config_readonly()
+        approvals = cfg.get("approvals") if isinstance(cfg, Mapping) else None
+        if not isinstance(approvals, Mapping):
+            raise StrictApprovalBlocked("approvals configuration is unavailable")
+        current_mode = str(approvals.get("mode", "")).strip().lower()
+        if expected_mode != OPS_GUARDED_MODE or current_mode != expected_mode:
+            return frozenset()
+        configured = approvals.get("auto_approve_tools")
+        if configured is None:
+            return OPS_GUARDED_AUTO_TOOLS
+        if not isinstance(configured, (list, tuple, set, frozenset)):
+            raise StrictApprovalBlocked("approvals.auto_approve_tools must be a list")
+        names = frozenset(str(name).strip() for name in configured if str(name).strip())
+        unsupported = names - OPS_GUARDED_AUTO_TOOLS
+        if unsupported:
+            raise StrictApprovalBlocked(
+                "unsupported ops_guarded auto-approval tools: "
+                + ", ".join(sorted(unsupported))
+            )
+        return names
+    except StrictApprovalError:
+        raise
+    except Exception as exc:
+        raise StrictApprovalBlocked("ops_guarded policy could not be loaded") from exc
 
 
 def register_notifier(
@@ -529,6 +585,64 @@ class ApprovalStore:
         except Exception as exc:
             raise StrictApprovalBlocked("approval state could not be persisted") from exc
 
+    def create_auto_approved(self, pending: Mapping[str, Any]) -> None:
+        """Persist an immutable, already-authorized ops_guarded invocation."""
+
+        required = tuple(_Pending.__dataclass_fields__)
+        if any(name not in pending for name in required):
+            raise StrictApprovalBlocked("auto-approval payload is incomplete")
+        try:
+            with self._lock, self._connect() as conn:
+                conn.execute("BEGIN IMMEDIATE")
+                conn.execute(
+                    """INSERT INTO pending_approvals(
+                        approval_id,tool_call_id,tool_name,canonical_args,args_hash,
+                        session_id,conversation_id,telegram_user_id,telegram_chat_id,
+                        created_at,expires_at,payload_mac,decision_mac,status,
+                        resolved_at,resolved_by_user_id,resolved_by_chat_id,resolution_reason
+                    ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?, 'approved', ?, ?, ?, 'ops_guarded')""",
+                    tuple(pending[name] for name in required)
+                    + (
+                        time.time(),
+                        str(pending["telegram_user_id"]),
+                        str(pending["telegram_chat_id"]),
+                    ),
+                )
+                self._audit(conn, "auto_approved", pending, "ops_guarded")
+                conn.commit()
+        except StrictApprovalError:
+            raise
+        except Exception as exc:
+            raise StrictApprovalBlocked("auto-approval state could not be persisted") from exc
+
+    def block_auto_approved(self, approval_id: str, *, reason: str) -> None:
+        """Invalidate an auto-approved row when its required notification fails."""
+
+        try:
+            with self._lock, self._connect() as conn:
+                conn.execute("BEGIN IMMEDIATE")
+                row = conn.execute(
+                    "SELECT * FROM pending_approvals WHERE approval_id=?",
+                    (str(approval_id),),
+                ).fetchone()
+                if row and row["status"] == "approved" and row["resolution_reason"] == "ops_guarded":
+                    _verify_decision_mac(_load_mac_key(), row, "approved")
+                    conn.execute(
+                        """UPDATE pending_approvals
+                           SET status='blocked', resolved_at=?, resolution_reason=?, decision_mac=?
+                           WHERE approval_id=? AND status='approved'""",
+                        (
+                            time.time(),
+                            _redact_text(str(reason)),
+                            _decision_mac(_load_mac_key(), row, "blocked"),
+                            str(approval_id),
+                        ),
+                    )
+                    self._audit(conn, "blocked", row, reason)
+                conn.commit()
+        except Exception as exc:
+            raise StrictApprovalBlocked("auto-approval state could not be blocked") from exc
+
     def get(self, approval_id: str) -> _Pending | None:
         try:
             with self._connect() as conn:
@@ -725,10 +839,18 @@ def require_tool_approval(
     }
     mac_key = _load_mac_key()
     pending_data["payload_mac"] = _payload_mac(mac_key, pending_data)
-    pending_data["decision_mac"] = _decision_mac(mac_key, pending_data, "pending")
     store = _get_store()
     display_args = redacted_args_json(args)
-    store.create(pending_data, display_args=display_args)
+    profile_home = str(get_hermes_home())
+    with _strict_latch_lock:
+        active_mode = _strict_latched_modes.get(profile_home, "")
+    auto_approved = str(tool_name) in _ops_guarded_auto_tools(active_mode)
+    decision_status = "approved" if auto_approved else "pending"
+    pending_data["decision_mac"] = _decision_mac(mac_key, pending_data, decision_status)
+    if auto_approved:
+        store.create_auto_approved(pending_data)
+    else:
+        store.create(pending_data, display_args=display_args)
 
     try:
         display_args_value: Any = json.loads(display_args)
@@ -746,6 +868,7 @@ def require_tool_approval(
         "telegram_user_id": user_id,
         "telegram_chat_id": chat_id,
         "expires_at": pending_data["expires_at"],
+        "auto_approved": auto_approved,
     }
     try:
         sent = notifier.callback(payload)
@@ -757,8 +880,23 @@ def require_tool_approval(
         if sent is False:
             raise RuntimeError("Telegram approval message was not sent")
     except Exception as exc:
-        store.expire(pending_data["approval_id"], reason="notifier_failure")
+        if auto_approved:
+            store.block_auto_approved(
+                pending_data["approval_id"], reason="notifier_failure"
+            )
+        else:
+            store.expire(pending_data["approval_id"], reason="notifier_failure")
         raise StrictApprovalBlocked("Telegram approval request could not be sent") from exc
+
+    if auto_approved:
+        return ApprovedInvocation(
+            approval_id=pending_data["approval_id"],
+            tool_call_id=call_id,
+            tool_name=str(tool_name),
+            canonical_args=canonical_args_text,
+            args_hash=call_hash,
+            args=json.loads(canonical_args_text),
+        )
 
     approval_id = pending_data["approval_id"]
     waiter = threading.Event()

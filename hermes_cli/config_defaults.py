@@ -2032,6 +2032,8 @@ DEFAULT_CONFIG = {
 
     # Global approval mode:
     #   every_tool — every enabled tool waits for one Telegram approval.
+    #   ops_guarded — the fixed read/interaction allow-list runs after an
+    #                 immediate Telegram notice; every other tool waits.
     # Legacy modes remain available when explicitly selected:
     #   manual — legacy dangerous-command prompt mode
     #   smart  — legacy auxiliary-LLM command assessment mode
@@ -2055,6 +2057,15 @@ DEFAULT_CONFIG = {
         "timeout_seconds": 900,
         "allow_session_approval": False,
         "allow_permanent_approval": False,
+        "auto_approve_tools": [
+            "read_file",
+            "search_files",
+            "skills_list",
+            "skill_view",
+            "session_search",
+            "wiki_read",
+            "clarify",
+        ],
         "cron_mode": "deny",
         # Operator-customizable policy text for smart approvals. When
         # non-empty, this is appended to the smart-approval guardian's

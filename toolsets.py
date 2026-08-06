@@ -502,7 +502,7 @@ TOOLSETS = {
             "Safe operations profile: terminal, files, code, browser, HTTP/web, "
             "skills, memory, session search, cron, MCP and wiki. Delegation, "
             "desktop control, messaging, and media generation are opt-in. "
-            "Pair with approvals.mode=every_tool."
+            "Pair with approvals.mode=every_tool or ops_guarded."
         ),
         "tools": _OPS_TOOLS,
         "includes": [],

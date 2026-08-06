@@ -6,14 +6,15 @@
 
 Security-focused fork of [NousResearch/hermes-agent](https://github.com/NousResearch/hermes-agent) for operating production infrastructure through Telegram.
 
-Every enabled tool call must receive a fresh, one-time approval from the bound Telegram user and chat **before execution**. This applies to terminal commands, files, code, browser and HTTP access, MCP, memory, wiki, skills, cron and other tools.
+The fork puts every enabled tool call behind one global Telegram gate. In `every_tool`, every call needs a fresh one-time approval. The production-oriented `ops_guarded` mode auto-authorizes only the seven explicitly listed read/interaction tools after successfully sending an immediate Telegram notice; everything else still waits for 🥦 or 🦀.
 
 ## Security model
 
 - One immutable pending approval per tool call.
 - Canonical JSON arguments and a SHA-256 payload hash.
 - Binding to approval, tool-call, session, conversation, Telegram user and chat IDs.
-- Only **Allow once** and **Deny** actions; no session or permanent approval.
+- Manual prompts expose only 🥦 and 🦀; no session or permanent approval.
+- Auto-authorized calls are shown as `😵‍💫 Разрешено автоматически`; manual cards remain in chat with their final status.
 - Retry or changed arguments require a new approval.
 - Timeout, restart, invalid callback, damaged state or unavailable approval subsystem fail closed.
 - Secrets are redacted in Telegram and audit logs without modifying the execution payload.
@@ -43,7 +44,7 @@ Add the web-search extra you use, for example:
 uv sync --locked --extra messaging --extra mcp --extra cli --extra parallel-web
 ```
 
-## Minimal strict configuration
+## Minimal ops configuration
 
 `~/.hermes/config.yaml`:
 
@@ -52,15 +53,25 @@ toolsets:
   - ops
 
 approvals:
-  mode: every_tool
+  mode: ops_guarded
   timeout_seconds: 900
   allow_session_approval: false
   allow_permanent_approval: false
+  auto_approve_tools:
+    - read_file
+    - search_files
+    - skills_list
+    - skill_view
+    - session_search
+    - wiki_read
+    - clarify
 
 wiki:
   enabled: true
   root: ~/.hermes/wiki
 ```
+
+The list may narrow the built-in seven-tool allow-list but cannot widen it. Use `mode: every_tool` when reads and clarification must also wait for manual approval.
 
 Configure the Telegram token and restrict access to trusted user IDs. The production-oriented personality is available at [`deploy/strict-ops/SOUL.md`](deploy/strict-ops/SOUL.md); install it as `~/.hermes/SOUL.md`.
 

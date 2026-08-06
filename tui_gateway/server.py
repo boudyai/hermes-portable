@@ -173,9 +173,9 @@ def _strict_unattended_rpc_reason(operation: str) -> str | None:
         if not strict_mode_enabled():
             return None
     except Exception:
-        return "every_tool approval subsystem unavailable"
+        return "strict approval subsystem unavailable"
     return (
-        f"{operation} is blocked while approvals.mode=every_tool; "
+        f"{operation} is blocked while a strict approval mode is active; "
         "use a Telegram-bound approved tool call"
     )
 
@@ -3927,7 +3927,7 @@ def _write_config_key(key_path: str, value):
 
 
 _STATUSBAR_MODES = frozenset({"off", "top", "bottom"})
-_APPROVAL_MODES = frozenset({"every_tool", "manual", "smart", "off"})
+_APPROVAL_MODES = frozenset({"every_tool", "ops_guarded", "manual", "smart", "off"})
 
 
 def _load_approval_mode() -> str:
@@ -10792,7 +10792,7 @@ def _(rid, params: dict) -> dict:
             return _err(
                 rid,
                 4002,
-                f"unknown approval mode: {value}; pick one of every_tool|manual|smart|off",
+                f"unknown approval mode: {value}; pick one of every_tool|ops_guarded|manual|smart|off",
             )
 
         _write_config_key("approvals.mode", raw)

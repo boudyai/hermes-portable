@@ -5561,7 +5561,7 @@ class TelegramAdapter(BasePlatformAdapter):
         approval: Dict[str, Any],
         metadata: Optional[Dict[str, Any]] = None,
     ) -> SendResult:
-        """Send the fail-closed every-tool prompt with exactly two buttons."""
+        """Send a manual strict prompt or an ops_guarded auto-approval notice."""
         if not self._bot:
             return SendResult(success=False, error="Not connected")
         try:
@@ -5574,17 +5574,31 @@ class TelegramAdapter(BasePlatformAdapter):
             args = redact_for_display(approval.get("args", "[REDACTED]"))
             args_display = _format_strict_approval_args(args)
             expires = _html.escape(format_telegram_expiration(float(approval["expires_at"])))
+            auto_approved = bool(approval.get("auto_approved"))
 
             def render_prompt(display_args: str) -> str:
+                heading = (
+                    "✅ <b>Tool call</b>\n\n"
+                    if auto_approved
+                    else "🔐 <b>Подтверждение tool call</b>\n\n"
+                )
+                footer = (
+                    "<b>Статус:</b> 😵‍💫 Разрешено автоматически"
+                    if auto_approved
+                    else f"<b>Истекает:</b> {expires}"
+                )
                 return (
-                    "🔐 <b>Подтверждение tool call</b>\n\n"
-                    f"<b>Инструмент:</b> <code>{tool_name}</code>\n"
+                    heading + f"<b>Инструмент:</b> <code>{tool_name}</code>\n"
                     f"<b>Аргументы:</b>\n<pre>{_html.escape(display_args)}</pre>\n"
-                    f"<b>Истекает:</b> {expires}"
+                    f"{footer}"
                 )
 
             text = render_prompt(args_display)
-            if utf16_len(text) > self.MAX_MESSAGE_LENGTH:
+            # Manual callbacks append a terminal status to this exact prompt.
+            # Reserve enough UTF-16 units so the later edit cannot exceed the
+            # Telegram limit and silently leave live buttons behind.
+            message_limit = self.MAX_MESSAGE_LENGTH - (128 if not auto_approved else 0)
+            if utf16_len(text) > message_limit:
                 truncation_marker = (
                     "\n… [аргументы сокращены; полный payload сохранён]"
                 )
@@ -5592,18 +5606,20 @@ class TelegramAdapter(BasePlatformAdapter):
                 while lo < hi:
                     mid = (lo + hi + 1) // 2
                     candidate = args_display[:mid] + truncation_marker
-                    if utf16_len(render_prompt(candidate)) <= self.MAX_MESSAGE_LENGTH:
+                    if utf16_len(render_prompt(candidate)) <= message_limit:
                         lo = mid
                     else:
                         hi = mid - 1
                 text = render_prompt(args_display[:lo] + truncation_marker)
             approval_id = str(approval["approval_id"])
-            keyboard = InlineKeyboardMarkup([
-                [
-                    InlineKeyboardButton("🥦", callback_data=f"ga:a:{approval_id}"),
-                    InlineKeyboardButton("🦀", callback_data=f"ga:d:{approval_id}"),
-                ]
-            ])
+            keyboard = None
+            if not auto_approved:
+                keyboard = InlineKeyboardMarkup([
+                    [
+                        InlineKeyboardButton("🥦", callback_data=f"ga:a:{approval_id}"),
+                        InlineKeyboardButton("🦀", callback_data=f"ga:d:{approval_id}"),
+                    ]
+                ])
             chat_id = str(approval["telegram_chat_id"])
             thread_id = self._metadata_thread_id(metadata)
             reply_to_id = self._reply_to_message_id_for_send(
@@ -5627,6 +5643,14 @@ class TelegramAdapter(BasePlatformAdapter):
                 )
             )
             msg = await self._send_message_with_thread_fallback(**kwargs)
+            if not auto_approved:
+                if not hasattr(self, "_strict_approval_prompt_text"):
+                    self._strict_approval_prompt_text = {}
+                self._strict_approval_prompt_text[approval_id] = text
+                while len(self._strict_approval_prompt_text) > 512:
+                    self._strict_approval_prompt_text.pop(
+                        next(iter(self._strict_approval_prompt_text))
+                    )
             return SendResult(success=True, message_id=str(msg.message_id))
         except Exception as exc:
             logger.warning(
@@ -6496,12 +6520,24 @@ class TelegramAdapter(BasePlatformAdapter):
                 await query.answer(text="Истекло, уже обработано или нет доступа.")
                 return
 
-            label = "✅ Разрешено один раз" if action == "approve" else "❌ Отклонено"
+            label = "🥦 Разрешено" if action == "approve" else "🦀 Запрещено"
             await query.answer(text=label)
             try:
+                prompt_text = None
+                prompt_cache = getattr(self, "_strict_approval_prompt_text", None)
+                if isinstance(prompt_cache, dict):
+                    prompt_text = prompt_cache.pop(approval_id, None)
+                if not prompt_text:
+                    message_html = getattr(query_message, "text_html", None)
+                    if isinstance(message_html, str) and message_html:
+                        prompt_text = message_html
+                    else:
+                        prompt_text = _html.escape(
+                            str(getattr(query_message, "text", "") or "")
+                        )
                 await query.edit_message_text(
-                    text=self.format_message(label),
-                    parse_mode=ParseMode.MARKDOWN_V2,
+                    text=f"{prompt_text}\n\n<b>Статус:</b> {label}",
+                    parse_mode=ParseMode.HTML,
                     reply_markup=None,
                 )
             except Exception:

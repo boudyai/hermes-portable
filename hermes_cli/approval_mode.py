@@ -13,7 +13,7 @@ from dataclasses import dataclass
 from io import StringIO
 from typing import Optional
 
-VALID_APPROVAL_MODES = ("manual", "smart", "off", "every_tool")
+VALID_APPROVAL_MODES = ("manual", "smart", "off", "every_tool", "ops_guarded")
 
 
 @dataclass(frozen=True)
@@ -48,7 +48,7 @@ def run_approval_mode_command(requested_mode: Optional[str]) -> ApprovalModeResu
             False,
             current,
             False,
-            "Usage: /approvals [manual|smart|off|every_tool]",
+            "Usage: /approvals [manual|smart|off|every_tool|ops_guarded]",
         )
 
     # set_config_value is the canonical managed-scope/write-safety chokepoint.

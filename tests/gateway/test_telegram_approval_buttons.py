@@ -243,6 +243,32 @@ class TestTelegramStrictToolApproval:
         assert captured_rows == [buttons]
 
     @pytest.mark.asyncio
+    async def test_auto_approved_notice_has_status_and_no_buttons(self):
+        adapter = _make_adapter()
+        sent = {}
+
+        async def capture_send(**kwargs):
+            sent.update(kwargs)
+            return SimpleNamespace(message_id=45)
+
+        adapter._bot.send_message = AsyncMock(side_effect=capture_send)
+        result = await adapter.send_strict_tool_approval(
+            approval={
+                "approval_id": "approval-auto",
+                "tool_name": "read_file",
+                "args": {"path": "/root/wiki/index.md"},
+                "expires_at": time.time() + 900,
+                "telegram_chat_id": "12345",
+                "auto_approved": True,
+            }
+        )
+
+        assert result.success is True
+        assert "😵‍💫 Разрешено автоматически" in sent["text"]
+        assert sent["reply_markup"] is None
+        assert "approval-auto" not in getattr(adapter, "_strict_approval_prompt_text", {})
+
+    @pytest.mark.asyncio
     @pytest.mark.parametrize("content", ["x" * 5400, "🧱" * 3000])
     async def test_long_arguments_fit_telegram_utf16_limit(self, content):
         adapter = _make_adapter()
@@ -321,6 +347,41 @@ class TestTelegramStrictToolApproval:
 
 class TestTelegramApprovalCallback:
     """Test the approval callback handling in _handle_callback_query."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("callback_action", "expected_status"),
+        [("a", "🥦 Разрешено"), ("d", "🦀 Запрещено")],
+    )
+    async def test_strict_callback_preserves_prompt_and_appends_status(
+        self, callback_action, expected_status
+    ):
+        adapter = _make_adapter()
+        adapter._strict_approval_prompt_text = {
+            "approval-123": (
+                "🔐 <b>Подтверждение tool call</b>\n\n"
+                "<b>Инструмент:</b> <code>terminal</code>\n"
+                "<b>Аргументы:</b>\n<pre>command: true</pre>"
+            )
+        }
+        query = AsyncMock()
+        query.data = f"ga:{callback_action}:approval-123"
+        query.message = MagicMock()
+        query.message.chat_id = 12345
+        query.from_user = MagicMock(id="100")
+        query.answer = AsyncMock()
+        query.edit_message_text = AsyncMock()
+        update = MagicMock(callback_query=query)
+
+        with patch("tools.strict_approval.resolve_approval", return_value=True):
+            await adapter._handle_callback_query(update, MagicMock())
+
+        edit_kwargs = query.edit_message_text.call_args.kwargs
+        assert "<code>terminal</code>" in edit_kwargs["text"]
+        assert "command: true" in edit_kwargs["text"]
+        assert expected_status in edit_kwargs["text"]
+        assert edit_kwargs["reply_markup"] is None
+        assert "HTML" in repr(edit_kwargs["parse_mode"])
 
 
     @pytest.mark.asyncio
