@@ -35,7 +35,7 @@ from hermes_constants import get_hermes_home
 logger = logging.getLogger(__name__)
 
 APPROVAL_MODE = "every_tool"
-DEFAULT_TIMEOUT_SECONDS = 300
+DEFAULT_TIMEOUT_SECONDS = 900
 
 
 class StrictApprovalError(RuntimeError):

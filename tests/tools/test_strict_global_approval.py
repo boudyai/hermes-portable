@@ -497,6 +497,28 @@ def test_strict_policy_cannot_be_downgraded_by_a_live_tool_call(tmp_path, monkey
         approval._strict_config()
 
 
+def test_strict_policy_defaults_to_fifteen_minutes(tmp_path, monkeypatch):
+    """Missing timeout settings still provide a practical Telegram window."""
+    from hermes_cli import config as config_module
+
+    monkeypatch.setattr(approval, "get_hermes_home", lambda: tmp_path)
+    with approval._strict_latch_lock:
+        approval._strict_latched_homes.discard(str(tmp_path))
+    monkeypatch.setattr(
+        config_module,
+        "load_config_readonly",
+        lambda: {
+            "approvals": {
+                "mode": "every_tool",
+                "allow_session_approval": False,
+                "allow_permanent_approval": False,
+            }
+        },
+    )
+
+    assert approval._strict_config() == (True, 900.0)
+
+
 @pytest.mark.parametrize(
     "tool_name",
     [
