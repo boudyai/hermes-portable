@@ -6,7 +6,7 @@
 
 Security-focused fork of [NousResearch/hermes-agent](https://github.com/NousResearch/hermes-agent) for operating production infrastructure through Telegram.
 
-The fork puts every enabled tool call behind one global Telegram gate. In `every_tool`, every call needs a fresh one-time approval. The production-oriented `ops_guarded` mode auto-authorizes only the seven explicitly listed read/interaction tools after successfully sending an immediate Telegram notice; everything else still waits for 🥦 or 🦀.
+The fork puts every enabled tool call behind one global Telegram gate. In `every_tool`, every call needs a fresh one-time approval. The production-oriented `ops_guarded` mode auto-authorizes only the seven explicitly listed read/interaction tools plus provably read-only `terminal`/`remote_terminal` shell commands, always after successfully sending an immediate Telegram notice; everything else still waits for 🥦 or 🦀.
 
 ## Security model
 
@@ -72,6 +72,8 @@ wiki:
 ```
 
 The list may narrow the built-in seven-tool allow-list but cannot widen it. Use `mode: every_tool` when reads and clarification must also wait for manual approval.
+
+Independently of `auto_approve_tools`, `ops_guarded` also auto-authorizes `terminal` and `remote_terminal` calls whose `command` is provably read-only: every simple command across pipes/`&&`/`;`/newlines must be in a fixed allow-list (`ls`, `cat`, `grep`, `find`, `docker ps|logs|inspect`, `systemctl status|show`, ...), with no command substitution, no heredocs, no output redirection except to `/dev/null`, and no references to sensitive paths (`.env`, `~/.ssh`, private keys, `/etc/shadow`, the approval store itself, ...). Anything the classifier cannot prove safe — including ambiguous cases — falls back to the manual 🥦/🦀 prompt. The boundary is hardcoded and cannot be widened from config.
 
 Configure the Telegram token and restrict access to trusted user IDs. The production-oriented personality is available at [`deploy/strict-ops/SOUL.md`](deploy/strict-ops/SOUL.md); install it as `~/.hermes/SOUL.md`.
 

@@ -601,14 +601,17 @@ def test_ops_guarded_cannot_widen_auto_tools_from_config(monkeypatch):
         approval._ops_guarded_auto_tools("ops_guarded")
 
 
-def test_ops_guarded_terminal_still_requires_manual_approval(strict_env, monkeypatch):
+def test_ops_guarded_terminal_still_requires_manual_approval(strict_env, monkeypatch, tmp_path):
     monkeypatch.setattr(
         approval,
         "_ops_guarded_auto_tools",
         lambda _mode: approval.OPS_GUARDED_AUTO_TOOLS,
     )
+    _latch_mode(tmp_path, approval.OPS_GUARDED_MODE)
 
-    seen, result, thread = _wait_for_prompt(None, strict_env, {"command": "true"})
+    # A writing command is outside the read-only shell boundary even in
+    # ops_guarded mode, so it goes to the human.
+    seen, result, thread = _wait_for_prompt(None, strict_env, {"command": "touch /tmp/demo-marker"})
     assert seen["auto_approved"] is False
     assert approval.resolve_approval(
         seen["approval_id"],
@@ -618,6 +621,128 @@ def test_ops_guarded_terminal_still_requires_manual_approval(strict_env, monkeyp
     )
     thread.join(2)
     assert "denied" in str(result["error"]).lower()
+
+
+def _latch_mode(tmp_path, mode):
+    with approval._strict_latch_lock:
+        approval._strict_latched_homes.add(str(tmp_path))
+        approval._strict_latched_modes[str(tmp_path)] = mode
+
+
+def _auto_notify_seen():
+    seen = {}
+    approval.unregister_notifier("telegram:session")
+    approval.register_notifier(
+        "telegram:session",
+        lambda payload: seen.update(payload) or True,
+        telegram_user_id="100",
+        telegram_chat_id="200",
+    )
+    return seen
+
+
+def test_ops_guarded_readonly_terminal_command_auto_approved(strict_env, tmp_path):
+    _latch_mode(tmp_path, approval.OPS_GUARDED_MODE)
+    seen = _auto_notify_seen()
+
+    invocation = approval.require_tool_approval(
+        "terminal",
+        {"command": "grep error /var/log/syslog | grep 2026-08-07 | wc -l"},
+        tool_call_id="ro-terminal-1",
+        session_id="conversation-1",
+    )
+
+    assert invocation is not None
+    assert invocation.tool_call_id == "ro-terminal-1"
+    assert seen["auto_approved"] is True
+    assert seen["tool_name"] == "terminal"
+    assert strict_env.status(seen["approval_id"]) == "approved"
+
+
+def test_ops_guarded_readonly_remote_terminal_command_auto_approved(strict_env, tmp_path):
+    _latch_mode(tmp_path, approval.OPS_GUARDED_MODE)
+    seen = _auto_notify_seen()
+
+    invocation = approval.require_tool_approval(
+        "remote_terminal",
+        {"command": "ls -la /var/log", "host": "root@192.168.2.91"},
+        tool_call_id="ro-remote-1",
+        session_id="conversation-1",
+    )
+
+    assert invocation is not None
+    assert seen["auto_approved"] is True
+    assert seen["tool_name"] == "remote_terminal"
+    assert strict_env.status(seen["approval_id"]) == "approved"
+
+
+def test_ops_guarded_non_readonly_remote_terminal_stays_manual(strict_env, tmp_path):
+    _latch_mode(tmp_path, approval.OPS_GUARDED_MODE)
+    seen = _auto_notify_seen()
+    result = {}
+
+    def worker():
+        try:
+            result["value"] = approval.require_tool_approval(
+                "remote_terminal",
+                {"command": "rm -rf /tmp/x", "host": "root@192.168.2.91"},
+                tool_call_id="rw-remote-1",
+                session_id="conversation-1",
+            )
+        except BaseException as exc:
+            result["error"] = exc
+
+    thread = threading.Thread(target=worker)
+    thread.start()
+    for _ in range(100):
+        if seen:
+            break
+        time.sleep(0.01)
+    assert seen
+    assert seen["auto_approved"] is False
+    assert approval.resolve_approval(
+        seen["approval_id"], "deny",
+        telegram_user_id="100", telegram_chat_id="200",
+    )
+    thread.join(2)
+    assert "denied" in str(result["error"]).lower()
+
+
+def test_every_tool_readonly_terminal_stays_manual(strict_env, tmp_path):
+    _latch_mode(tmp_path, approval.APPROVAL_MODE)
+    seen, result, thread = _wait_for_prompt(None, strict_env, {"command": "ls -la /tmp"})
+    assert seen["auto_approved"] is False
+    assert approval.resolve_approval(
+        seen["approval_id"], "deny",
+        telegram_user_id="100", telegram_chat_id="200",
+    )
+    thread.join(2)
+    assert "denied" in str(result["error"]).lower()
+
+
+def test_ops_guarded_readonly_notification_failure_blocks_execution(strict_env, tmp_path):
+    _latch_mode(tmp_path, approval.OPS_GUARDED_MODE)
+    seen = {}
+    approval.unregister_notifier("telegram:session")
+
+    def fail_notify(payload):
+        seen.update(payload)
+        return False
+
+    approval.register_notifier(
+        "telegram:session", fail_notify,
+        telegram_user_id="100", telegram_chat_id="200",
+    )
+
+    with pytest.raises(approval.StrictApprovalBlocked, match="could not be sent"):
+        approval.require_tool_approval(
+            "terminal",
+            {"command": "ls -la /tmp"},
+            tool_call_id="ro-terminal-failed",
+            session_id="conversation-1",
+        )
+
+    assert strict_env.status(seen["approval_id"]) == "blocked"
 
 
 @pytest.mark.parametrize(

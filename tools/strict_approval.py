@@ -31,6 +31,7 @@ from pathlib import Path
 from typing import Any, Callable, Iterator, Mapping
 
 from hermes_constants import get_hermes_home
+from tools.readonly_shell import READONLY_SHELL_TOOLS, is_readonly_shell_command
 
 logger = logging.getLogger(__name__)
 
@@ -845,6 +846,18 @@ def require_tool_approval(
     with _strict_latch_lock:
         active_mode = _strict_latched_modes.get(profile_home, "")
     auto_approved = str(tool_name) in _ops_guarded_auto_tools(active_mode)
+    if (
+        not auto_approved
+        and active_mode == OPS_GUARDED_MODE
+        and str(tool_name) in READONLY_SHELL_TOOLS
+    ):
+        # Provably read-only shell commands (no redirection other than
+        # /dev/null, no substitution, allowlisted binaries, no sensitive
+        # paths) get the same notified auto-approval as trusted read tools.
+        # Anything the classifier cannot prove safe stays fully manual.
+        auto_approved = is_readonly_shell_command(
+            args.get("command") if isinstance(args, Mapping) else None
+        )
     decision_status = "approved" if auto_approved else "pending"
     pending_data["decision_mac"] = _decision_mac(mac_key, pending_data, decision_status)
     if auto_approved:
