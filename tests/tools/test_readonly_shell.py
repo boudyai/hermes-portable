@@ -69,6 +69,32 @@ class TestAutoApprovable:
     def test_user_example_logs(self):
         assert is_ro(EXAMPLE_AUTO_LOGS) is True
 
+    def test_user_example_host_inventory(self):
+        cmd = (
+            "echo '=== HOST ==='; hostname; uname -a; uptime; "
+            "echo '=== OS ==='; head -5 /etc/os-release; systemd-detect-virt; "
+            "echo '=== MEM ==='; free -h; "
+            "echo '=== DISKS ==='; df -h | grep -v tmpfs; "
+            "echo '=== LSBLK ==='; lsblk -o NAME,SIZE,TYPE,MOUNTPOINTS,FSTYPE"
+        )
+        assert is_ro(cmd) is True
+
+    def test_user_example_host_inventory_multiline(self):
+        cmd = """echo '=== HOST ==='
+hostname
+uname -a
+uptime
+echo '=== OS ==='
+head -5 /etc/os-release
+systemd-detect-virt
+echo '=== MEM ==='
+free -h
+echo '=== DISKS ==='
+df -h | grep -v tmpfs
+echo '=== LSBLK ==='
+lsblk -o NAME,SIZE,TYPE,MOUNTPOINTS,FSTYPE"""
+        assert is_ro(cmd) is True
+
     def test_line_continuation(self):
         assert is_ro("grep foo \\\n  bar.txt | wc -l") is True
 

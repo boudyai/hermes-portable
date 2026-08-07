@@ -35,7 +35,7 @@ _SIMPLE_READONLY = frozenset({
     "basename", "dirname", "uniq", "cut", "tr", "true", "false", "test", "[",
     "lsblk", "netstat", "vmstat", "iostat", "lscpu", "lsmem",
     "lsof", "nproc", "arch", "tty", "logname", "groups", "tree", "which",
-    "type",
+    "type", "systemd-detect-virt",
 })
 
 # Commands with read-only capability that have specific writing flags.
