@@ -214,6 +214,12 @@ TOOLSETS = {
         "tools": ["terminal", "process"],
         "includes": []
     },
+
+    "remote_terminal": {
+        "description": "Execute shell commands on a remote host over SSH (key-based auth only)",
+        "tools": ["remote_terminal"],
+        "includes": []
+    },
     
     "skills": {
         "description": "Access, create, edit, and manage skill documents with specialized instructions and knowledge",
