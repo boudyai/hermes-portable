@@ -3,6 +3,7 @@
 from tools.registry import ToolRegistry
 from toolsets import (
     TOOLSETS,
+    _HERMES_CORE_TOOLS,
     get_toolset,
     resolve_toolset,
     resolve_multiple_toolsets,
@@ -70,6 +71,8 @@ class TestResolveToolset:
 
     def test_ops_excludes_non_ops_capabilities(self):
         tools = set(resolve_toolset("ops"))
+        assert "remote_terminal" in _HERMES_CORE_TOOLS
+        assert "remote_terminal" in tools
         assert "delegate_task" not in tools
         assert "computer_use" not in tools
         assert "image_generate" not in tools

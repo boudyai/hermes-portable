@@ -53,8 +53,41 @@ def remote_terminal_tool(
     timeout: int | None = None,
     workdir: str = "",
     task_id: str = None,
+    _approval_args: dict | None = None,
+    _tool_call_id: str = "",
+    _session_id: str = "",
 ) -> str:
     """Execute a shell command on a remote host over SSH."""
+    approval_args = (
+        dict(_approval_args)
+        if isinstance(_approval_args, dict)
+        else {
+            "command": command,
+            "host": host,
+            "port": port,
+            "key_path": key_path,
+            "timeout": timeout,
+            "workdir": workdir,
+        }
+    )
+    try:
+        from tools.strict_approval import ensure_handler_approval
+
+        strict_handler_approved = ensure_handler_approval(
+            "remote_terminal",
+            approval_args,
+            tool_call_id=str(_tool_call_id or ""),
+            session_id=str(_session_id or task_id or ""),
+            conversation_id=str(_session_id or task_id or ""),
+        )
+    except Exception as strict_error:
+        logger.error("Remote terminal global approval blocked: %s", strict_error)
+        return tool_error(
+            "Global approval blocked: security subsystem unavailable or call not approved",
+            success=False,
+            tool="remote_terminal",
+        )
+
     if not command or not str(command).strip():
         return tool_error("command must not be empty", success=False, tool="remote_terminal")
     command = str(command)
@@ -92,21 +125,22 @@ def remote_terminal_tool(
     # Legacy (non-strict) path: run the same dangerous-command guards the
     # local terminal tool applies. In strict approval mode the registry
     # dispatch layer has already gated this exact call via Telegram.
-    try:
-        from tools.approval import check_all_command_guards
-        from tools.terminal_tool import _get_approval_callback
+    if not strict_handler_approved:
+        try:
+            from tools.approval import check_all_command_guards
+            from tools.terminal_tool import _get_approval_callback
 
-        guard = check_all_command_guards(
-            command, "ssh", approval_callback=_get_approval_callback()
-        )
-        if not guard.get("approved"):
-            return json.dumps({
-                "success": False,
-                "error": guard.get("message") or "Command was not approved",
-                "blocked": True,
-            }, ensure_ascii=False)
-    except ImportError:
-        logger.debug("Command guard modules unavailable; skipping legacy guard")
+            guard = check_all_command_guards(
+                command, "ssh", approval_callback=_get_approval_callback()
+            )
+            if not guard.get("approved"):
+                return json.dumps({
+                    "success": False,
+                    "error": guard.get("message") or "Command was not approved",
+                    "blocked": True,
+                }, ensure_ascii=False)
+        except ImportError:
+            logger.debug("Command guard modules unavailable; skipping legacy guard")
 
     argv = [
         "ssh",
@@ -211,6 +245,9 @@ def _handle_remote_terminal(args, **kw):
         timeout=args.get("timeout"),
         workdir=args.get("workdir", ""),
         task_id=kw.get("task_id"),
+        _approval_args=dict(args),
+        _tool_call_id=kw.get("tool_call_id", ""),
+        _session_id=kw.get("session_id", ""),
     )
 
 

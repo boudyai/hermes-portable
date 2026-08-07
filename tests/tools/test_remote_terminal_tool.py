@@ -32,6 +32,14 @@ def no_guard(monkeypatch):
     return guard
 
 
+@pytest.fixture(autouse=True)
+def no_strict_gate(monkeypatch):
+    """Most unit tests exercise legacy behavior outside strict mode."""
+    gate = MagicMock(return_value=False)
+    monkeypatch.setattr("tools.strict_approval.ensure_handler_approval", gate)
+    return gate
+
+
 class TestArgvConstruction:
     def test_default_uses_ssh_key_discovery(self, mock_run):
         rt.remote_terminal_tool(command="ls", host="example.com")
@@ -134,6 +142,28 @@ class TestResults:
         out = json.loads(rt.remote_terminal_tool(command="rm -rf /", host="h"))
         assert out["success"] is False
         assert out["blocked"] is True
+        mock_run.assert_not_called()
+
+    def test_strict_scope_skips_second_legacy_prompt(
+        self, mock_run, no_guard, no_strict_gate
+    ):
+        no_strict_gate.return_value = True
+
+        out = json.loads(rt.remote_terminal_tool(command="systemctl status ssh", host="h"))
+
+        assert out["success"] is True
+        no_guard.assert_not_called()
+        mock_run.assert_called_once()
+
+    def test_direct_call_fails_closed_when_strict_gate_breaks(
+        self, mock_run, no_strict_gate
+    ):
+        no_strict_gate.side_effect = RuntimeError("approval unavailable")
+
+        out = json.loads(rt.remote_terminal_tool(command="id", host="h"))
+
+        assert out["success"] is False
+        assert "Global approval blocked" in out["error"]
         mock_run.assert_not_called()
 
 

@@ -32,7 +32,7 @@ _HERMES_CORE_TOOLS = [
     # Web
     "web_search", "web_extract", "http_request",
     # Terminal + process management
-    "terminal", "process",
+    "terminal", "process", "remote_terminal",
     # Desktop GUI affordances: read the embedded terminal pane, close an agent's
     # read-only terminal tab, open a URL/file in the preview pane, focus a
     # pane, and react to a message with an emoji (all gated on HERMES_DESKTOP
