@@ -98,6 +98,25 @@ def _check_ss(args: list[str]) -> None:
     if _has_short_flag_letter(args, "K") or "--kill" in args:
         raise _Unsafe("ss killing sockets")
 
+
+# hostnamectl set-hostname / set-icon-name / ... mutate host state; only the
+# bare status query and display flags are read-only.
+_HOSTNAMECTL_SAFE_ARGS = frozenset({
+    "status", "--static", "--transient", "--pretty",
+    "-j", "--json", "--json=pretty", "--json=short",
+})
+
+
+def _check_hostnamectl(args: list[str]) -> None:
+    if any(arg not in _HOSTNAMECTL_SAFE_ARGS for arg in args):
+        raise _Unsafe("hostnamectl may set host metadata")
+
+
+# mount with operands mounts a filesystem; flag-only invocations list mounts.
+def _check_mount(args: list[str]) -> None:
+    if any(not arg.startswith("-") for arg in args):
+        raise _Unsafe("mount with operands mounts a filesystem")
+
 # Paths the agent must not read without a human looking at the call first.
 _SENSITIVE_RE = re.compile(
     r"\.env($|\.)"                                   # .env, .env.local, foo.env
@@ -123,6 +142,38 @@ _SENSITIVE_RE = re.compile(
 _SEPARATORS = frozenset({";", "&&", "||", "|"})
 
 _DEV_NULL = "/dev/null"
+
+# The only heredoc form eligible for auto-approval: `bash -s <<'TAG'` (or
+# `sh -s`) as the entire command, with a quoted tag so the invoking shell
+# performs no expansion inside the body, and the body itself must pass the
+# same read-only classification recursively. Anything else containing `<<`
+# stays manual.
+_STDIN_SCRIPT_HEADER_RE = re.compile(
+    r"^[ \t]*(?:bash|sh)[ \t]+-s[ \t]*"
+    r"<<(?P<dash>-)?[ \t]*(?P<quote>['\"])(?P<tag>[A-Za-z_][A-Za-z0-9_]*)(?P=quote)"
+    r"[ \t]*\n"
+)
+
+
+def _extract_stdin_script(command: str) -> str | None:
+    """Return the verified heredoc body of a bare ``bash -s <<'TAG'`` call.
+
+    Returns None when the command is not exactly that shape: extra words or
+    redirects in the header, an unquoted tag, a missing terminator, or any
+    trailing content after the terminator line.
+    """
+    m = _STDIN_SCRIPT_HEADER_RE.match(command)
+    if not m:
+        return None
+    tag = m.group("tag")
+    lines = command[m.end():].split("\n")
+    for idx, line in enumerate(lines):
+        candidate = line.lstrip("\t") if m.group("dash") else line
+        if candidate.rstrip("\r") == tag:
+            if "\n".join(lines[idx + 1:]).strip():
+                return None  # content after the terminator
+            return "\n".join(lines[:idx])
+    return None  # unterminated heredoc
 
 
 def _tokenize(command: str) -> list[tuple[str, str]]:
@@ -254,6 +305,12 @@ def _check_simple_command(argv: list[str]) -> None:
     if name == "ss":
         _check_ss(rest)
         return
+    if name == "hostnamectl":
+        _check_hostnamectl(rest)
+        return
+    if name == "mount":
+        _check_mount(rest)
+        return
     if name == "journalctl":
         if any(arg.startswith(_JOURNALCTL_REJECT_PREFIXES) for arg in rest):
             raise _Unsafe("journalctl with log-mutating flag")
@@ -272,14 +329,22 @@ def _check_simple_command(argv: list[str]) -> None:
 def is_readonly_shell_command(command: object) -> bool:
     """Return True when *command* is provably read-only.
 
-    Guarantees when True: no command substitution, no heredocs, no input
-    redirection, no output redirection except to /dev/null or fd duplication,
-    no backgrounding, no sensitive path references, and every simple command
-    (across ``;``/``&&``/``||``/newlines and pipe stages) is in the read-only
-    allowlist.
+    Guarantees when True: no command substitution, no heredocs except a
+    whole-command ``bash -s <<'TAG'`` whose quoted-tag body itself passes
+    this same check, no input redirection, no output redirection except to
+    /dev/null or fd duplication, no backgrounding, no sensitive path
+    references, and every simple command (across ``;``/``&&``/``||``/newlines
+    and pipe stages) is in the read-only allowlist.
     """
     if not isinstance(command, str) or not command.strip():
         return False
+    script = _extract_stdin_script(command)
+    if script is not None:
+        # `bash -s <<'TAG'` with a quoted tag: the invoking shell cannot
+        # expand the body, so the body is judged as a script of its own.
+        if not script.strip():
+            return False
+        return is_readonly_shell_command(script)
     try:
         tokens = _tokenize(command)
         current: list[str] = []
