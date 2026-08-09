@@ -7,11 +7,20 @@ auto-authorized (with notification) in ``ops_guarded`` mode.
 Design rule: when in doubt, return False — the call falls back to the normal
 manual human-in-the-loop approval. An extra approval prompt is always
 preferable to a destructive command slipping through.
+
+This classifies operational mutation and arbitrary child execution separately
+from broad read visibility.  It blocks explicit references to known credential
+paths, but ordinary recursive searches and shell-expanded read paths remain
+eligible: output redaction and filesystem permissions are the confidentiality
+boundary.  Bare command names resolve through the operator's trusted shell
+environment; per-command PATH/loader overrides and workspace executable paths
+are rejected.
 """
 
 from __future__ import annotations
 
 import logging
+import posixpath
 import re
 
 logger = logging.getLogger(__name__)
@@ -30,21 +39,25 @@ class _Unsafe(Exception):
 # on purpose.
 _SIMPLE_READONLY = frozenset({
     "ls", "cat", "grep", "egrep", "fgrep", "head", "tail", "wc", "echo",
-    "printf", "pwd", "df", "du", "free", "uname", "ps", "uptime",
-    "whoami", "id", "stat", "file", "readlink", "realpath",
-    "basename", "dirname", "uniq", "cut", "tr", "true", "false", "test", "[",
+    "pwd", "df", "du", "free", "uname", "ps", "uptime",
+    "whoami", "id", "stat", "readlink", "realpath",
+    "basename", "dirname", "cut", "tr", "true", "false", "test", "[",
     "lsblk", "netstat", "vmstat", "iostat", "lscpu", "lsmem",
-    "lsof", "nproc", "arch", "tty", "logname", "groups", "tree", "which",
-    "type", "systemd-detect-virt",
+    "lsof", "nproc", "arch", "tty", "logname", "groups", "which",
+    "type", "systemd-detect-virt", "cmp", "comm", "strings",
+    "md5", "md5sum", "sha1sum", "sha224sum", "sha256sum", "sha384sum",
+    "sha512sum", "shasum",
 })
 
 # Commands with read-only capability that have specific writing flags.
 _FIND_REJECT_ARGS = frozenset({
-    "-exec", "-execdir", "-ok", "-okdir", "-delete", "-fprint", "-fprintf", "-fls",
+    "-exec", "-execdir", "-ok", "-okdir", "-delete", "-fprint", "-fprint0",
+    "-fprintf", "-fls",
 })
 _JOURNALCTL_REJECT_PREFIXES = (
     "--vacuum", "--rotate", "--flush", "--sync",
     "--relinquish-var", "--smart-relinquish-var",
+    "--update-catalog", "--setup-keys",
 )
 _DOCKER_READONLY_SUBCOMMANDS = frozenset({
     "ps", "logs", "inspect", "images", "version", "info", "port", "stats",
@@ -55,7 +68,16 @@ _SYSTEMCTL_READONLY_SUBCOMMANDS = frozenset({
     "is-enabled", "is-failed", "show", "cat",
 })
 
-_ENV_ASSIGNMENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
+_TRUSTED_EXEC_DIRS = frozenset({"/bin", "/usr/bin", "/sbin", "/usr/sbin"})
+
+# Explicit operator-approved exception.  Nix store paths are immutable, but
+# do not trust arbitrary store executables merely because their basename says
+# "podman"; this one path and observational subcommand were requested.
+_TRUSTED_SUDO_PODMAN_PS = (
+    "sudo", "-n",
+    "/nix/store/gz8a9rmhs82qrv01h0yfrqvk3ndb63bm-podman-5.8.2/bin/podman",
+    "ps",
+)
 
 
 def _has_short_flag_letter(args: list[str], letter: str) -> bool:
@@ -67,6 +89,193 @@ def _has_short_flag_letter(args: list[str], letter: str) -> bool:
 def _check_sort(args: list[str]) -> None:
     if _has_short_flag_letter(args, "o") or any(a.startswith("--output") for a in args):
         raise _Unsafe("sort with output file")
+    if any(a == "--compress-program" or a.startswith("--compress-program=") for a in args):
+        raise _Unsafe("sort with external compression program")
+
+
+def _check_printf(args: list[str]) -> None:
+    if args and (args[0] == "-v" or args[0].startswith("-v")):
+        raise _Unsafe("printf -v mutates shell state")
+
+
+def _check_file(args: list[str]) -> None:
+    if _has_short_flag_letter(args, "C") or "--compile" in args:
+        raise _Unsafe("file --compile writes a magic database")
+
+
+def _check_tree(args: list[str]) -> None:
+    if _has_short_flag_letter(args, "o") or any(
+        arg == "--output" or arg.startswith("--output=") for arg in args
+    ):
+        raise _Unsafe("tree with output file")
+
+
+_UNIQ_VALUE_OPTIONS = frozenset({
+    "-f", "--skip-fields", "-s", "--skip-chars", "-w", "--check-chars",
+})
+
+
+def _check_uniq(args: list[str]) -> None:
+    """Allow at most INPUT; GNU/BSD ``uniq INPUT OUTPUT`` writes OUTPUT."""
+    operands = 0
+    consume_value = False
+    options_done = False
+    for arg in args:
+        if consume_value:
+            consume_value = False
+            continue
+        if not options_done and arg == "--":
+            options_done = True
+            continue
+        if not options_done and arg in _UNIQ_VALUE_OPTIONS:
+            consume_value = True
+            continue
+        if not options_done and arg.startswith("--"):
+            continue
+        if not options_done and arg.startswith("-") and arg != "-":
+            continue
+        operands += 1
+    if consume_value:
+        raise _Unsafe("uniq option is missing its value")
+    if operands > 1:
+        raise _Unsafe("uniq with OUTPUT operand writes a file")
+
+
+def _check_rg(args: list[str]) -> None:
+    if any(
+        arg in {"--pre", "--hostname-bin"}
+        or arg.startswith("--pre=")
+        or arg.startswith("--hostname-bin=")
+        for arg in args
+    ):
+        raise _Unsafe("rg option executes an external program")
+
+
+def _check_fd(args: list[str]) -> None:
+    if any(
+        arg in {"-x", "--exec", "-X", "--exec-batch"}
+        or (arg.startswith("-x") and not arg.startswith("--"))
+        or (arg.startswith("-X") and not arg.startswith("--"))
+        or arg.startswith("--exec=")
+        or arg.startswith("--exec-batch=")
+        for arg in args
+    ):
+        raise _Unsafe("fd option executes an external program")
+
+
+def _check_diff(args: list[str]) -> None:
+    if any(
+        arg == "--output"
+        or arg.startswith("--output=")
+        for arg in args
+    ):
+        raise _Unsafe("diff option writes output to a file")
+
+
+_GIT_METADATA_SUBCOMMANDS = frozenset({
+    "status", "rev-parse", "ls-files", "ls-tree", "describe",
+})
+_GIT_DIFF_SUMMARY_ARGS = frozenset({
+    "--stat", "--shortstat", "--numstat", "--name-only", "--name-status",
+    "--summary", "--quiet", "--exit-code", "--check",
+})
+_GIT_REJECT_GLOBAL_PREFIXES = (
+    "-c", "--config-env", "--exec-path", "--paginate",
+)
+_GIT_OUTPUT_OR_HELP_ARGS = frozenset({"--help", "-h", "--paginate"})
+
+
+def _git_reject_output_or_helpers(args: list[str]) -> None:
+    if any(
+        arg in _GIT_OUTPUT_OR_HELP_ARGS
+        or arg == "--output"
+        or arg.startswith("--output=")
+        or arg == "--ext-diff"
+        or arg == "--textconv"
+        or arg == "--show-signature"
+        for arg in args
+    ):
+        raise _Unsafe("git option may write output or execute a helper")
+
+
+def _check_git(args: list[str]) -> None:
+    """Allow observational Git queries without helpers or ref mutations."""
+    idx = 0
+    while idx < len(args):
+        arg = args[idx]
+        if arg in {"--no-pager", "--no-optional-locks", "--literal-pathspecs"}:
+            idx += 1
+            continue
+        if arg == "-C":
+            if idx + 1 >= len(args):
+                raise _Unsafe("git -C is missing a directory")
+            idx += 2
+            continue
+        if arg.startswith("-C") and len(arg) > 2:
+            idx += 1
+            continue
+        if arg.startswith(_GIT_REJECT_GLOBAL_PREFIXES):
+            raise _Unsafe("git global option may alter execution")
+        break
+    if idx >= len(args):
+        raise _Unsafe("git subcommand is missing")
+
+    subcommand = args[idx]
+    rest = args[idx + 1:]
+    _git_reject_output_or_helpers(rest)
+    if subcommand in _GIT_METADATA_SUBCOMMANDS:
+        return
+    if subcommand == "log":
+        if any(
+            arg in {"-p", "-u", "--patch", "--raw"}
+            or arg.startswith("--patch-with-")
+            for arg in rest
+        ):
+            raise _Unsafe("git log option may execute a helper or expose patches")
+        return
+    if subcommand == "diff":
+        if not any(arg.split("=", 1)[0] in _GIT_DIFF_SUMMARY_ARGS for arg in rest):
+            raise _Unsafe("git diff requires a summary-only output mode")
+        return
+    if subcommand == "branch":
+        mutating = {"-d", "-D", "-m", "-M", "-c", "-C", "-f",
+                    "--delete", "--move", "--copy", "--edit-description",
+                    "--set-upstream-to", "--unset-upstream"}
+        if any(arg.split("=", 1)[0] in mutating for arg in rest):
+            raise _Unsafe("git branch option mutates refs or config")
+        if any(not arg.startswith("-") for arg in rest):
+            raise _Unsafe("git branch with a name may create a branch")
+        return
+    if subcommand == "tag":
+        if not rest:
+            return
+        if rest[0] not in {"-l", "--list"}:
+            raise _Unsafe("git tag requires list mode")
+        mutating = {"-a", "-s", "-u", "-f", "-d", "-v", "--annotate",
+                    "--sign", "--local-user", "--force", "--delete", "--verify"}
+        if any(arg.split("=", 1)[0] in mutating for arg in rest[1:]):
+            raise _Unsafe("git tag option is not list-only")
+        return
+    if subcommand == "remote":
+        if rest in ([], ["-v"], ["--verbose"]):
+            return
+        if rest and rest[0] == "get-url" and all(
+            arg in {"--all", "--push"} or not arg.startswith("-")
+            for arg in rest[1:]
+        ):
+            return
+        raise _Unsafe("git remote operation is not observational")
+    raise _Unsafe("git subcommand is not in observational allowlist")
+
+
+def _trusted_command_name(token: str) -> str:
+    """Return a trusted command basename, rejecting workspace executables."""
+    if "/" not in token:
+        return token
+    normalized = posixpath.normpath(token)
+    if posixpath.dirname(normalized) not in _TRUSTED_EXEC_DIRS:
+        raise _Unsafe("executable path is outside trusted system directories")
+    return posixpath.basename(normalized)
 
 
 # date -s / date MMDDhhmm set the system clock; only +FORMAT / display flags
@@ -112,10 +321,28 @@ def _check_hostnamectl(args: list[str]) -> None:
         raise _Unsafe("hostnamectl may set host metadata")
 
 
-# mount with operands mounts a filesystem; flag-only invocations list mounts.
+# ``mount`` with no arguments lists mounts.  Only its help/version and display
+# flags preserve that behavior; notably, flag-only ``mount -a`` mounts every
+# filesystem from fstab.
+_MOUNT_SAFE_LONG_ARGS = frozenset({
+    "--help", "--show-labels", "--verbose", "--version",
+})
+_MOUNT_SAFE_SHORT_FLAG_LETTERS = frozenset("hlvV")
+
+
 def _check_mount(args: list[str]) -> None:
-    if any(not arg.startswith("-") for arg in args):
-        raise _Unsafe("mount with operands mounts a filesystem")
+    for arg in args:
+        if arg in _MOUNT_SAFE_LONG_ARGS:
+            continue
+        if (
+            arg.startswith("-")
+            and not arg.startswith("--")
+            and len(arg) > 1
+            and set(arg[1:]) <= _MOUNT_SAFE_SHORT_FLAG_LETTERS
+        ):
+            continue
+        raise _Unsafe("mount invocation may mount a filesystem")
+
 
 # Paths the agent must not read without a human looking at the call first.
 _SENSITIVE_RE = re.compile(
@@ -275,16 +502,18 @@ def _first_non_flag(args: list[str]) -> str | None:
 
 def _check_simple_command(argv: list[str]) -> None:
     """Raise _Unsafe unless *argv* is a provably read-only invocation."""
-    while argv and _ENV_ASSIGNMENT_RE.match(argv[0]):
-        argv = argv[1:]
     if not argv:
         raise _Unsafe("empty command")
+    if tuple(argv) == _TRUSTED_SUDO_PODMAN_PS:
+        return
+    if re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", argv[0]):
+        raise _Unsafe("environment assignments can alter command execution")
 
     for token in argv:
         if _SENSITIVE_RE.search(token):
             raise _Unsafe(f"sensitive path reference: {token!r}")
 
-    name = argv[0].rsplit("/", 1)[-1]
+    name = _trusted_command_name(argv[0])
     rest = argv[1:]
 
     if name in _SIMPLE_READONLY:
@@ -295,6 +524,30 @@ def _check_simple_command(argv: list[str]) -> None:
         return
     if name == "sort":
         _check_sort(rest)
+        return
+    if name == "printf":
+        _check_printf(rest)
+        return
+    if name == "file":
+        _check_file(rest)
+        return
+    if name == "tree":
+        _check_tree(rest)
+        return
+    if name == "uniq":
+        _check_uniq(rest)
+        return
+    if name in {"rg", "ripgrep"}:
+        _check_rg(rest)
+        return
+    if name == "fd":
+        _check_fd(rest)
+        return
+    if name == "diff":
+        _check_diff(rest)
+        return
+    if name == "git":
+        _check_git(rest)
         return
     if name == "date":
         _check_date(rest)

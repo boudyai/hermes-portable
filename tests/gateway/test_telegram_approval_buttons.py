@@ -1,5 +1,6 @@
 """Tests for Telegram inline keyboard approval buttons."""
 
+import html
 import os
 import sys
 import time
@@ -47,9 +48,13 @@ def _ensure_telegram_mock():
 
 _ensure_telegram_mock()
 
-from plugins.platforms.telegram.adapter import TelegramAdapter
+from plugins.platforms.telegram.adapter import (
+    TelegramAdapter,
+    _format_strict_approval_args,
+)
 from gateway.config import Platform, PlatformConfig
 from gateway.platforms.base import utf16_len
+from tools.strict_approval import redact_for_display
 
 
 def _make_adapter(extra=None):
@@ -243,6 +248,38 @@ class TestTelegramStrictToolApproval:
         assert captured_rows == [buttons]
 
     @pytest.mark.asyncio
+    async def test_redacted_command_remains_readable_and_footer_is_separated(self):
+        adapter = _make_adapter()
+        sent = {}
+
+        async def capture_send(**kwargs):
+            sent.update(kwargs)
+            return SimpleNamespace(message_id=46)
+
+        adapter._bot.send_message = AsyncMock(side_effect=capture_send)
+        result = await adapter.send_strict_tool_approval(
+            approval={
+                "approval_id": "approval-redacted-command",
+                "tool_name": "terminal",
+                "args": {
+                    "command": (
+                        "curl -H 'Authorization: Bearer super-secret-value' "
+                        "https://example.test"
+                    )
+                },
+                "expires_at": time.time() + 300,
+                "telegram_chat_id": "12345",
+            }
+        )
+
+        assert result.success is True
+        assert "curl -H" in sent["text"]
+        assert "https://example.test" in sent["text"]
+        assert "super-secret-value" not in sent["text"]
+        assert "[REDACTED]</pre>" not in sent["text"]
+        assert "</pre>\n\n<b>Истекает:</b>" in sent["text"]
+
+    @pytest.mark.asyncio
     async def test_auto_approved_notice_has_status_and_no_buttons(self):
         adapter = _make_adapter()
         sent = {}
@@ -269,30 +306,79 @@ class TestTelegramStrictToolApproval:
         assert "approval-auto" not in getattr(adapter, "_strict_approval_prompt_text", {})
 
     @pytest.mark.asyncio
-    @pytest.mark.parametrize("content", ["x" * 5400, "🧱" * 3000])
-    async def test_long_arguments_fit_telegram_utf16_limit(self, content):
+    @pytest.mark.parametrize("content", [
+        "x" * 5400,
+        "🧱" * 3000,
+        "&<>" * 2000,
+    ])
+    async def test_long_arguments_are_paginated_without_truncation(self, content):
         adapter = _make_adapter()
-        sent = {}
+        sent_pages = []
 
         async def capture_send(**kwargs):
-            sent.update(kwargs)
-            return SimpleNamespace(message_id=43)
+            sent_pages.append(kwargs)
+            return SimpleNamespace(message_id=40 + len(sent_pages))
 
         adapter._bot.send_message = AsyncMock(side_effect=capture_send)
+        args = {"path": "/root/wiki/codeserver.md", "content": content}
         result = await adapter.send_strict_tool_approval(
             approval={
                 "approval_id": "approval-long",
                 "tool_name": "write_file",
-                "args": {"path": "/root/wiki/codeserver.md", "content": content},
+                "args": args,
                 "expires_at": time.time() + 900,
                 "telegram_chat_id": "12345",
             }
         )
 
         assert result.success is True
-        assert utf16_len(sent["text"]) <= adapter.MAX_MESSAGE_LENGTH
-        assert "аргументы сокращены; полный payload сохранён" in sent["text"]
-        assert content not in sent["text"]
+        assert len(sent_pages) > 1
+        assert all(
+            utf16_len(page["text"]) <= adapter.MAX_MESSAGE_LENGTH
+            for page in sent_pages
+        )
+        assert all(page["reply_markup"] is None for page in sent_pages[:-1])
+        assert sent_pages[-1]["reply_markup"] is not None
+        assert all("<b>Истекает:</b>" not in page["text"] for page in sent_pages[:-1])
+        assert "<b>Истекает:</b>" in sent_pages[-1]["text"]
+        assert f"· 1/{len(sent_pages)}" in sent_pages[0]["text"]
+        assert f"· {len(sent_pages)}/{len(sent_pages)}" in sent_pages[-1]["text"]
+        assert not any("сокращен" in page["text"] for page in sent_pages)
+
+        displayed_chunks = []
+        for page in sent_pages:
+            text = page["text"]
+            start = text.index("<pre>") + len("<pre>")
+            end = text.index("</pre>", start)
+            displayed_chunks.append(html.unescape(text[start:end]))
+        expected = _format_strict_approval_args(redact_for_display(args))
+        assert "".join(displayed_chunks) == expected
+
+    @pytest.mark.asyncio
+    async def test_paginated_approval_failure_never_sends_buttons_early(self):
+        adapter = _make_adapter()
+        sent_pages = []
+
+        async def fail_second_page(**kwargs):
+            sent_pages.append(kwargs)
+            if len(sent_pages) == 2:
+                raise RuntimeError("telegram unavailable")
+            return SimpleNamespace(message_id=50 + len(sent_pages))
+
+        adapter._bot.send_message = AsyncMock(side_effect=fail_second_page)
+        result = await adapter.send_strict_tool_approval(
+            approval={
+                "approval_id": "approval-page-failure",
+                "tool_name": "write_file",
+                "args": {"content": "x" * 9000},
+                "expires_at": time.time() + 900,
+                "telegram_chat_id": "12345",
+            }
+        )
+
+        assert result.success is False
+        assert len(sent_pages) == 2
+        assert all(page["reply_markup"] is None for page in sent_pages)
 
     @pytest.mark.asyncio
     async def test_multiline_arguments_render_as_readable_blocks(self):

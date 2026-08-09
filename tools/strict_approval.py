@@ -1,9 +1,11 @@
 """Fail-closed, per-tool Telegram approval for strict approval modes.
 
-This module intentionally does not inspect command contents.  The decision is
-always made by the human who owns the exact Telegram chat/user binding.  The
-normal dangerous-command approval code remains available for legacy modes; the
-strict path is a separate narrow waist used by every dispatcher entry point.
+In ``every_tool`` mode the decision is always made by the human who owns the
+exact Telegram chat/user binding.  ``ops_guarded`` additionally recognizes a
+narrow, fail-closed set of observational shell commands and trusted read tools,
+notifies the owner, and auto-approves them.  The normal dangerous-command
+approval code remains available for legacy modes; the strict path is a separate
+narrow waist used by every dispatcher entry point.
 
 The pending row contains the exact canonical payload used for execution.  The
 payload is never replaced with its redacted display form.  A local MAC key and
@@ -20,6 +22,7 @@ import inspect
 import json
 import logging
 import os
+import re
 import secrets
 import sqlite3
 import stat
@@ -146,6 +149,22 @@ _SECRET_KEY_PARTS = (
     "client_key", "signing_key", "encryption_key",
 )
 
+_DISPLAY_SECRET_NAME = (
+    r"(?:api[-_]?key|apikey|password|passwd|client[-_]?secret|"
+    r"access[-_]?token|refresh[-_]?token|telegram[-_]?bot[-_]?token|token|secret)"
+)
+_DISPLAY_CLI_SECRET_RE = re.compile(
+    rf"(?P<prefix>(?:--{_DISPLAY_SECRET_NAME}(?:=|[ \t]+)|"
+    rf"\b{_DISPLAY_SECRET_NAME}=))"
+    r"(?:(?P<single>'[^']*')|(?P<double>\"[^\"]*\")|(?P<bare>[^\s'\"]+))",
+    re.IGNORECASE,
+)
+_DISPLAY_AUTH_SCHEME_RE = re.compile(
+    r"(?P<prefix>\b(?:Bearer|Basic)[ \t]+)"
+    r"(?:(?P<single>'[^']*')|(?P<double>\"[^\"]*\")|(?P<bare>[^\s'\"]+))",
+    re.IGNORECASE,
+)
+
 
 def _secret_key(key: str) -> bool:
     lowered = str(key).lower().replace("-", "_")
@@ -165,23 +184,17 @@ def _redact_text(text: str) -> str:
         # redactor is unavailable.
         return "[REDACTED]"
 
-    # Belt-and-suspenders markers for common credential forms.  These are
-    # display redactions, never approval rules. Hide the whole containing
-    # string when a connection string/header/token marker is present; keeping
-    # the suffix would risk leaking the credential after the marker.
-    lowered = value.lower()
-    if any(
-        marker in lowered
-        for marker in (
-            "authorization:", "authorization=", "bearer ", "basic ",
-            "postgres://", "postgresql://", "mysql://", "mariadb://",
-            "redis://", "mongodb://", "mongodb+srv://", "mssql://",
-            "jdbc:", "sqlite://",
-            "api_key=", "apikey=", "password=", "passwd=", "client_secret=",
-            "access_token=", "refresh_token=", "telegram_bot_token=",
-        )
-    ):
-        return "[REDACTED]"
+    # The authoritative redactor masks credential values while preserving the
+    # surrounding command.  Do not replace that useful, already-safe preview
+    # with a bare [REDACTED]; if importing or running the redactor fails, the
+    # exception path above still fails closed and hides the entire string.
+    def _mask_display_match(match: re.Match[str]) -> str:
+        quoted = match.group("single") or match.group("double") or ""
+        quote = quoted[:1]
+        return f"{match.group('prefix')}{quote}[REDACTED]{quote}"
+
+    value = _DISPLAY_CLI_SECRET_RE.sub(_mask_display_match, value)
+    value = _DISPLAY_AUTH_SCHEME_RE.sub(_mask_display_match, value)
     if "-----BEGIN " in value and "PRIVATE KEY-----" in value:
         return "[REDACTED PRIVATE KEY]"
     return value
@@ -855,8 +868,12 @@ def require_tool_approval(
         # /dev/null, no substitution, allowlisted binaries, no sensitive
         # paths) get the same notified auto-approval as trusted read tools.
         # Anything the classifier cannot prove safe stays fully manual.
-        auto_approved = is_readonly_shell_command(
-            args.get("command") if isinstance(args, Mapping) else None
+        command_args = args if isinstance(args, Mapping) else {}
+        # PTYs can activate configured pagers (systemctl/journalctl/etc.),
+        # which turns an observational command into arbitrary child-process
+        # execution. Foreground/background pipe execution remains eligible.
+        auto_approved = not bool(command_args.get("pty")) and is_readonly_shell_command(
+            command_args.get("command")
         )
     decision_status = "approved" if auto_approved else "pending"
     pending_data["decision_mac"] = _decision_mac(mac_key, pending_data, decision_status)

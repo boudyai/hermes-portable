@@ -430,6 +430,23 @@ def test_secrets_are_redacted_only_in_display_and_audit(strict_env):
     thread.join(2)
 
 
+@pytest.mark.parametrize("command, secret", [
+    (
+        "curl -H 'Authorization: Bearer super-secret-value' https://example.test",
+        "super-secret-value",
+    ),
+    ("client --password=hunter2 status", "hunter2"),
+    ("client --password 'two words' status", "two words"),
+    ("db-check postgresql://user:password@db.internal/app", "password"),
+])
+def test_redacted_command_keeps_safe_context_visible(command, secret):
+    display = approval.redact_for_display({"command": command})["command"]
+
+    assert display != "[REDACTED]"
+    assert command.split()[0] in display
+    assert secret not in display
+
+
 def test_notifier_failure_and_configuration_failure_block(strict_env, monkeypatch):
     approval.unregister_notifier("telegram:session")
     approval.register_notifier(
@@ -657,6 +674,23 @@ def test_ops_guarded_readonly_terminal_command_auto_approved(strict_env, tmp_pat
     assert seen["auto_approved"] is True
     assert seen["tool_name"] == "terminal"
     assert strict_env.status(seen["approval_id"]) == "approved"
+
+
+def test_ops_guarded_readonly_terminal_with_pty_stays_manual(strict_env, tmp_path):
+    _latch_mode(tmp_path, approval.OPS_GUARDED_MODE)
+    seen, result, thread = _wait_for_prompt(
+        None,
+        strict_env,
+        {"command": "systemctl status nginx", "pty": True},
+    )
+
+    assert seen["auto_approved"] is False
+    assert approval.resolve_approval(
+        seen["approval_id"], "deny",
+        telegram_user_id="100", telegram_chat_id="200",
+    )
+    thread.join(2)
+    assert "denied" in str(result["error"]).lower()
 
 
 def test_ops_guarded_readonly_remote_terminal_command_auto_approved(strict_env, tmp_path):

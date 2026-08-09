@@ -5576,45 +5576,76 @@ class TelegramAdapter(BasePlatformAdapter):
             expires = _html.escape(format_telegram_expiration(float(approval["expires_at"])))
             auto_approved = bool(approval.get("auto_approved"))
 
-            def render_prompt(display_args: str) -> str:
+            def render_prompt(
+                display_args: str,
+                *,
+                page: int = 1,
+                total_pages: int = 1,
+                include_footer: bool = True,
+            ) -> str:
+                page_suffix = f" · {page}/{total_pages}" if total_pages > 1 else ""
                 heading = (
-                    "✅ <b>Tool call</b>\n\n"
+                    f"✅ <b>Tool call{page_suffix}</b>\n\n"
                     if auto_approved
-                    else "🔐 <b>Подтверждение tool call</b>\n\n"
+                    else f"🔐 <b>Подтверждение tool call{page_suffix}</b>\n\n"
                 )
                 footer = (
                     "<b>Статус:</b> 😵‍💫 Разрешено автоматически"
                     if auto_approved
                     else f"<b>Истекает:</b> {expires}"
                 )
-                return (
+                text = (
                     heading + f"<b>Инструмент:</b> <code>{tool_name}</code>\n"
                     f"<b>Аргументы:</b>\n<pre>{_html.escape(display_args)}</pre>\n"
-                    f"{footer}"
                 )
+                if include_footer:
+                    text += f"\n{footer}"
+                return text
 
-            text = render_prompt(args_display)
             # Manual callbacks append a terminal status to this exact prompt.
             # Reserve enough UTF-16 units so the later edit cannot exceed the
             # Telegram limit and silently leave live buttons behind.
             message_limit = self.MAX_MESSAGE_LENGTH - (128 if not auto_approved else 0)
-            if utf16_len(text) > message_limit:
-                truncation_marker = (
-                    "\n… [аргументы сокращены; полный payload сохранён]"
-                )
-                lo, hi = 0, len(args_display)
-                while lo < hi:
-                    mid = (lo + hi + 1) // 2
-                    candidate = args_display[:mid] + truncation_marker
-                    if utf16_len(render_prompt(candidate)) <= message_limit:
-                        lo = mid
+
+            # Approval payloads are a security surface: never truncate them.
+            # Split by rendered UTF-16 size (HTML escaping may expand one raw
+            # character to several) and size every provisional page with a
+            # worst-case page counter plus the footer. The real pages can only
+            # be shorter. Buttons/status live on the final page only.
+            page_chunks: List[str] = []
+            remaining = args_display
+            page_number = 1
+            total_hint = 999999
+            while remaining:
+                lo, hi = 1, len(remaining)
+                best = 0
+                while lo <= hi:
+                    mid = (lo + hi) // 2
+                    candidate = remaining[:mid]
+                    rendered = render_prompt(
+                        candidate,
+                        page=page_number,
+                        total_pages=total_hint,
+                        include_footer=True,
+                    )
+                    if utf16_len(rendered) <= message_limit:
+                        best = mid
+                        lo = mid + 1
                     else:
                         hi = mid - 1
-                text = render_prompt(args_display[:lo] + truncation_marker)
+                if best == 0:
+                    raise ValueError("strict approval metadata leaves no room for arguments")
+                page_chunks.append(remaining[:best])
+                remaining = remaining[best:]
+                page_number += 1
+            if not page_chunks:
+                page_chunks = [""]
+
+            total_pages = len(page_chunks)
             approval_id = str(approval["approval_id"])
-            keyboard = None
+            final_keyboard = None
             if not auto_approved:
-                keyboard = InlineKeyboardMarkup([
+                final_keyboard = InlineKeyboardMarkup([
                     [
                         InlineKeyboardButton("🥦", callback_data=f"ga:a:{approval_id}"),
                         InlineKeyboardButton("🦀", callback_data=f"ga:d:{approval_id}"),
@@ -5625,15 +5656,13 @@ class TelegramAdapter(BasePlatformAdapter):
             reply_to_id = self._reply_to_message_id_for_send(
                 None, metadata, reply_to_mode=self._reply_to_mode
             )
-            kwargs: Dict[str, Any] = {
+            common_kwargs: Dict[str, Any] = {
                 "chat_id": normalize_telegram_chat_id(chat_id),
-                "text": text,
                 "parse_mode": ParseMode.HTML,
-                "reply_markup": keyboard,
                 "reply_to_message_id": reply_to_id,
                 **self._link_preview_kwargs(),
             }
-            kwargs.update(
+            common_kwargs.update(
                 self._thread_kwargs_for_send(
                     chat_id,
                     thread_id,
@@ -5642,11 +5671,29 @@ class TelegramAdapter(BasePlatformAdapter):
                     reply_to_mode=self._reply_to_mode,
                 )
             )
-            msg = await self._send_message_with_thread_fallback(**kwargs)
+            msg = None
+            final_text = ""
+            for page_index, chunk in enumerate(page_chunks, start=1):
+                is_final = page_index == total_pages
+                page_text = render_prompt(
+                    chunk,
+                    page=page_index,
+                    total_pages=total_pages,
+                    include_footer=is_final,
+                )
+                msg = await self._send_message_with_thread_fallback(
+                    **common_kwargs,
+                    text=page_text,
+                    reply_markup=final_keyboard if is_final else None,
+                )
+                if is_final:
+                    final_text = page_text
+            if msg is None:
+                raise RuntimeError("strict approval produced no Telegram messages")
             if not auto_approved:
                 if not hasattr(self, "_strict_approval_prompt_text"):
                     self._strict_approval_prompt_text = {}
-                self._strict_approval_prompt_text[approval_id] = text
+                self._strict_approval_prompt_text[approval_id] = final_text
                 while len(self._strict_approval_prompt_text) > 512:
                     self._strict_approval_prompt_text.pop(
                         next(iter(self._strict_approval_prompt_text))
