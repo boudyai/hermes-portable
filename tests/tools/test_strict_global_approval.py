@@ -1006,8 +1006,7 @@ def test_cron_creation_waits_before_persisting_job(strict_env, monkeypatch):
 
     created = []
     monkeypatch.setattr(
-        cronjob_tools,
-        "create_job",
+        "cron.scheduler.create_job_with_scheduler_registration",
         lambda **kwargs: created.append(kwargs)
         or {
             "id": "job-1",
