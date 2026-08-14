@@ -28,6 +28,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 from typing import Any, Dict, List, Optional
 
 from agent.prompt_builder import (
@@ -50,9 +51,15 @@ from agent.prompt_builder import (
 )
 from agent.runtime_cwd import resolve_context_cwd
 from hermes_constants import get_hermes_home
+from pathlib import Path
 from utils import is_truthy_value
 
 logger = logging.getLogger(__name__)
+_PLUGIN_SECTION_FRAME_RE = re.compile(
+    r"^## Plugin Context: (?P<id>[a-z0-9][a-z0-9._-]{0,127})\n"
+    r"<!-- hermes-plugin-section-chars:(?P<chars>[0-9]{1,4}) -->\n\n",
+    re.MULTILINE,
+)
 
 
 def _ra():
@@ -147,6 +154,160 @@ def _tui_embedded_pane_clarifier(hint: str) -> str:
     if not is_truthy_value(os.getenv("HERMES_DESKTOP_TERMINAL")):
         return hint
     return hint + _TUI_EMBEDDED_PANE_CLARIFIER
+
+
+def _plugin_session_info(agent: Any) -> Dict[str, str]:
+    """Return immutable-at-render-time metadata exposed to prompt sections."""
+    try:
+        cwd = str(resolve_context_cwd() or "")
+    except Exception:
+        cwd = ""
+    try:
+        from hermes_cli.profiles import get_active_profile_name
+
+        profile_name = str(get_active_profile_name() or "default")
+    except Exception:
+        profile_name = "default"
+    return {
+        "session_id": str(getattr(agent, "session_id", None) or ""),
+        "model": str(getattr(agent, "model", None) or ""),
+        "provider": str(getattr(agent, "provider", None) or ""),
+        "platform": str(getattr(agent, "platform", None) or ""),
+        "profile_name": profile_name,
+        "cwd": cwd,
+    }
+
+
+def _frozen_plugin_prompt_sections(agent: Any) -> tuple:
+    """Render once on a new session; never re-evaluate a restored prompt.
+
+    Compression rebuilds reuse the per-agent tuple. A fresh process restores
+    ``_cached_system_prompt`` before reconstructing its static cache prefix;
+    because plugin sections live after memory in the volatile tail, that
+    reconstruction can safely omit them and must not call plugin code again.
+    """
+    attr = "_plugin_system_prompt_sections_snapshot"
+    if hasattr(agent, attr):
+        return getattr(agent, attr)
+    stored_prompt = getattr(agent, "_cached_system_prompt", None)
+    if isinstance(stored_prompt, str) and stored_prompt:
+        rendered = _restore_plugin_prompt_sections(stored_prompt)
+        setattr(agent, attr, rendered)
+        return rendered
+    try:
+        from hermes_cli.plugins import render_system_prompt_sections
+
+        rendered = tuple(render_system_prompt_sections(_plugin_session_info(agent)))
+    except Exception as exc:
+        logger.warning("Plugin system prompt sections could not be rendered: %s", exc)
+        rendered = ()
+    setattr(agent, attr, rendered)
+    return rendered
+
+
+def _restore_plugin_prompt_sections(prompt: str) -> tuple:
+    """Recover frozen section bytes from the already-persisted full prompt."""
+    from hermes_cli.plugins import (
+        MAX_SYSTEM_PROMPT_SECTION_CHARS,
+        PLUGIN_SECTIONS_END,
+        PLUGIN_SECTIONS_START,
+        RenderedPluginSystemPromptSection,
+        format_system_prompt_sections,
+    )
+
+    start = prompt.rfind(PLUGIN_SECTIONS_START)
+    if start < 0:
+        return ()
+    end = prompt.find(PLUGIN_SECTIONS_END, start + len(PLUGIN_SECTIONS_START))
+    if end < 0:
+        return ()
+    after_end = end + len(PLUGIN_SECTIONS_END)
+    if not prompt[after_end:].startswith("\n\nConversation started:"):
+        return ()
+    framed = prompt[start:after_end]
+
+    restored = []
+    for match in _PLUGIN_SECTION_FRAME_RE.finditer(framed):
+        content_len = int(match.group("chars"))
+        if content_len > MAX_SYSTEM_PROMPT_SECTION_CHARS:
+            continue
+        content_start = match.end()
+        content = framed[content_start : content_start + content_len]
+        if len(content) != content_len:
+            continue
+        restored.append(
+            RenderedPluginSystemPromptSection(
+                id=match.group("id"),
+                content=content,
+                position="after_memory",
+                plugin="persisted-prompt",
+            )
+        )
+    # User/project text may resemble a frame. Accept only the exact canonical
+    # container emitted by core, never a partial or malformed lookalike.
+    if format_system_prompt_sections(restored) != framed:
+        return ()
+    return tuple(restored)
+
+
+def restore_plugin_prompt_sections(agent: Any, prompt: str) -> None:
+    """Seed a resumed agent's frozen snapshot from persisted prompt bytes."""
+    agent._plugin_system_prompt_sections_snapshot = _restore_plugin_prompt_sections(prompt)
+
+
+def _plugin_section_blocks(sections: tuple, position: str) -> List[str]:
+    from hermes_cli.plugins import format_system_prompt_sections
+
+    selected = [section for section in sections if section.position == position]
+    block = format_system_prompt_sections(selected)
+    return [block] if block else []
+
+
+def _agent_home(agent: Any) -> Optional[Path]:
+    """The agent's OWN profile home, resolved from its dedicated session_db.
+
+    The agent's ``_session_db.db_path`` is ``<home>/state.db`` — ground truth
+    for which profile this agent belongs to, independent of any HERMES_HOME
+    ContextVar (which a build thread can lose: ContextVars don't propagate
+    into ``threading.Thread``, so an unbound build falls back to the launch
+    home and leaks the default profile's skills/identity into a bot prompt).
+    Returns None when it can't be resolved so callers fall back to ambient.
+    """
+    try:
+        db = getattr(agent, "_session_db", None)
+        db_path = getattr(db, "db_path", None)
+        if db_path:
+            return Path(db_path).parent
+    except Exception:
+        pass
+    return None
+
+
+def _agent_skills_dir(agent: Any) -> Optional[Path]:
+    """The agent's own ``<home>/skills`` dir, or None to use ambient home."""
+    home = _agent_home(agent)
+    return (home / "skills") if home is not None else None
+
+
+def _profile_name_for_home(home: Path) -> str:
+    """Derive the profile name for an explicit agent home.
+
+    ``<root>/profiles/X`` -> ``"X"``; anything else -> ``"default"``.
+
+    Uses :func:`get_default_hermes_root` (NOT ``get_hermes_home()``): on a
+    correctly bound profile session the ambient home IS the profile dir, so
+    ``get_hermes_home()/profiles`` would never contain ``home`` and every
+    profile would misreport as "default".
+    """
+    try:
+        from hermes_constants import get_default_hermes_root
+
+        root = get_default_hermes_root()
+        rel = home.resolve().relative_to((root / "profiles").resolve())
+        return rel.parts[0] if rel.parts else "default"
+    except (ValueError, OSError):
+        # Home IS the root (default profile) or unrelatable -> default.
+        return "default"
 
 
 def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) -> Dict[str, str]:
@@ -322,6 +483,7 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
             available_tools=agent.valid_tool_names,
             available_toolsets=avail_toolsets,
             compact_categories=_compact_cats or None,
+            skills_dir_override=_agent_skills_dir(agent),
         )
     else:
         skills_prompt = ""
@@ -401,15 +563,39 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     # mid-session, so this doesn't break the prompt cache.
     # See file_safety._resolve_active_profile_name + classify_cross_profile_target
     # for the matching tool-side guard.
+    #
+    # Resolve from the agent's OWN home first (its session_db path), not the
+    # ambient HERMES_HOME: on a build thread that lost the ContextVar this
+    # line would otherwise print "default" for a bot profile — the same
+    # thread-fallback bug that leaked default's skills index.
+    _agent_home_path = _agent_home(agent)
+    active_profile = "default"
     try:
-        from agent.file_safety import _resolve_active_profile_name
-        active_profile = _resolve_active_profile_name()
+        if _agent_home_path is not None:
+            active_profile = _profile_name_for_home(_agent_home_path)
+        else:
+            from agent.file_safety import _resolve_active_profile_name
+            active_profile = _resolve_active_profile_name()
     except Exception:
         active_profile = "default"
+    # Home string for the message text: prefer the agent's own home so the
+    # paths named match the profile just resolved. When we have an explicit
+    # agent home, the root (where the default profile's data lives) comes
+    # from get_default_hermes_root(): get_hermes_home() on a bound profile
+    # session is the PROFILE dir, which would misname the default profile's
+    # paths. Without an agent home, keep the ambient resolution byte-identical
+    # to the legacy behavior (and patchable via this module's get_hermes_home).
+    if _agent_home_path is not None:
+        from hermes_constants import get_default_hermes_root as _root_fn
+
+        _home_str = str(_agent_home_path)
+        _root_str = str(_root_fn())
+    else:
+        _home_str = _root_str = str(get_hermes_home())
     if active_profile == "default":
         post_workspace_parts.append(
             "Active Hermes profile: default. Other profiles (if any) live "
-            "under " + str(get_hermes_home()) + "/profiles/<name>/. Each profile has its own "
+            "under " + _root_str + "/profiles/<name>/. Each profile has its own "
             "skills/, plugins/, cron/, and memories/ that affect a different "
             "session than this one. Do not modify another profile's "
             "skills/plugins/cron/memories unless the user explicitly directs "
@@ -418,9 +604,9 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     else:
         post_workspace_parts.append(
             f"Active Hermes profile: {active_profile}. This session reads "
-            f"and writes {get_hermes_home()}/profiles/{active_profile}/. The default "
-            f"profile's data lives at {get_hermes_home()}/skills/, {get_hermes_home()}/plugins/, "
-            f"{get_hermes_home()}/cron/, {get_hermes_home()}/memories/ — those belong to a "
+            f"and writes {_home_str}/. The default "
+            f"profile's data lives at {_root_str}/skills/, {_root_str}/plugins/, "
+            f"{_root_str}/cron/, {_root_str}/memories/ — those belong to a "
             f"different session run from a different shell. Do NOT modify "
             f"another profile's skills/plugins/cron/memories unless the user "
             f"explicitly directs you to. The cross-profile write guard will "
@@ -539,6 +725,13 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
                 volatile_parts.append(_ext_mem_block)
         except Exception:
             pass
+
+    # Plugin sections are intentionally confined to one coarse anchor in the
+    # volatile tail. This preserves deterministic ordering and lets a resumed
+    # process reconstruct the stable cache prefix without re-running plugins.
+    volatile_parts.extend(
+        _plugin_section_blocks(_frozen_plugin_prompt_sections(agent), "after_memory")
+    )
 
     from hermes_time import now as _hermes_now
     now = _hermes_now()
@@ -689,5 +882,6 @@ __all__ = [
     "build_system_prompt_parts",
     "build_system_prompt",
     "invalidate_system_prompt",
+    "restore_plugin_prompt_sections",
     "format_tools_for_system_message",
 ]

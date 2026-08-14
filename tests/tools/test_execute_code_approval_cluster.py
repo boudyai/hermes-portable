@@ -110,6 +110,36 @@ def test_both_rpc_threads_use_propagation_helper():
     )
 
 
+def test_registry_handler_preserves_strict_approval_identity(monkeypatch):
+    """Upstream argument recovery must not drop the exact-call HITL identity."""
+    import tools.code_execution_tool as cet
+
+    seen = {}
+
+    def fake_execute_code(**kwargs):
+        seen.update(kwargs)
+        return "ok"
+
+    monkeypatch.setattr(cet, "execute_code", fake_execute_code)
+
+    result = cet._execute_code_handler(
+        {"code": "print('safe')"},
+        task_id="task-1",
+        enabled_tools=["read_file"],
+        tool_call_id="tool-call-1",
+        session_id="conversation-1",
+    )
+
+    assert result == "ok"
+    assert seen == {
+        "code": "print('safe')",
+        "task_id": "task-1",
+        "enabled_tools": ["read_file"],
+        "tool_call_id": "tool-call-1",
+        "session_id": "conversation-1",
+    }
+
+
 # ---------------------------------------------------------------------------
 # 3. check_execute_code_guard decision matrix
 # ---------------------------------------------------------------------------

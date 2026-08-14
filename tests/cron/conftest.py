@@ -53,6 +53,21 @@ def _default_cron_test_model(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _exercise_legacy_cron_approval_behavior(monkeypatch):
+    """Keep general cron tests below the strict scheduled-run boundary.
+
+    Strict HITL behavior has dedicated coverage in
+    ``tests/tools/test_strict_global_approval.py``.  Cron's ordinary unit tests
+    must not inherit the fork's secure ``every_tool`` default and wait for a
+    Telegram notifier that their fixtures intentionally do not install.
+    """
+    monkeypatch.setattr(
+        "tools.strict_approval._strict_config",
+        lambda: (False, 0.0),
+    )
+
+
+@pytest.fixture(autouse=True)
 def _reset_session_context_vars():
     """Restore session ContextVars around cron tests that call run_job directly.
 
