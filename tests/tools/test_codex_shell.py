@@ -2,6 +2,7 @@ from pathlib import Path
 
 import pytest
 
+from tools import codex_shell
 from tools.codex_shell import is_ops_guarded_codex_command
 from tools.readonly_shell import is_readonly_shell_command
 
@@ -99,6 +100,37 @@ def test_exact_server_scratch_shape_is_auto_approved(boundaries):
             "codex exec --sandbox danger-full-access 'read the wiki'"
         ),
         hermes_home,
+    )
+
+
+@pytest.mark.parametrize("redirect", ["", " 2>&1"])
+def test_exact_lab_workspace_wrapper_is_auto_approved(
+    boundaries, monkeypatch, redirect
+):
+    hermes_home, workdir = boundaries
+    monkeypatch.setattr(codex_shell, "_LAB_CODEX_WORKSPACE", str(workdir))
+    command = (
+        f"cd {workdir} && codex exec --sandbox workspace-write "
+        "-m gpt-5.6-sol -c model_reasoning_effort=medium "
+        f"'consult about systemd overrides'{redirect}"
+    )
+
+    assert is_ops_guarded_codex_command(_args(command, pty=True), hermes_home)
+
+
+def test_lab_workspace_wrapper_rejects_other_composition(boundaries, monkeypatch):
+    hermes_home, workdir = boundaries
+    monkeypatch.setattr(codex_shell, "_LAB_CODEX_WORKSPACE", str(workdir))
+    safe = (
+        f"cd {workdir} && codex exec --sandbox workspace-write "
+        "-m gpt-5.6-sol -c model_reasoning_effort=medium 'consult'"
+    )
+
+    assert not is_ops_guarded_codex_command(
+        _args(safe + " && cat ~/.hermes/wiki/private.md"), hermes_home
+    )
+    assert not is_ops_guarded_codex_command(
+        _args(safe.replace(str(workdir), "/root/other", 1)), hermes_home
     )
 
 

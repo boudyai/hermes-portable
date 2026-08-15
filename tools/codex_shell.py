@@ -18,6 +18,7 @@ from typing import Mapping, Any
 
 _ACCOUNT_RE = re.compile(r"~/.codex/auth\.account[A-Za-z0-9_.-]+\.json")
 _CODEX_AUTH = "~/.codex/auth.json"
+_LAB_CODEX_WORKSPACE = "/root/.codex-workspace"
 
 
 def _has_unquoted_shell_syntax(command: str) -> bool:
@@ -166,6 +167,24 @@ def _is_safe_codex_exec(
 def is_ops_guarded_codex_command(args: Mapping[str, Any], hermes_home: Path) -> bool:
     """Return whether a terminal call matches the reviewed Codex control policy."""
     command = args.get("command")
+
+    # lab-hermes uses one dedicated consultant workspace. Accept this exact
+    # shell wrapper (including the harmless stderr merge emitted by some
+    # callers), but no other ``cd`` target or shell composition. Resolve the
+    # directory before approval so replacing it with a symlink to /root or
+    # ~/.hermes fails the same workspace-boundary check as workdir=.
+    lab_prefix = f"cd {_LAB_CODEX_WORKSPACE} && "
+    if isinstance(command, str) and command.startswith(lab_prefix):
+        suffix = command[len(lab_prefix):]
+        if suffix.endswith(" 2>&1"):
+            suffix = suffix[:-5]
+        argv = _split_single_command(suffix)
+        return (
+            bool(argv)
+            and _safe_codex_workdir(_LAB_CODEX_WORKSPACE, hermes_home)
+            and _is_safe_codex_exec(argv, _LAB_CODEX_WORKSPACE, hermes_home)
+        )
+
     scratch_prefix = "cd $(mktemp -d) && git init && "
     if isinstance(command, str) and command.startswith(scratch_prefix):
         suffix = command[len(scratch_prefix):]

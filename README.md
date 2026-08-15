@@ -86,6 +86,12 @@ version/login status, device login, exact account-symlink switching, scratch
 scratch form is also recognized. Full-access/bypass flags, extra writable
 directories, arbitrary shell composition, remote execution, and reading
 `~/.codex/auth*.json` stay manually gated.
+On lab-hermes, the exact wrapper `cd /root/.codex-workspace && codex exec ...`
+is also accepted, with an optional final `2>&1`; the resolved directory must
+still pass the non-Hermes workspace boundary check.
+The observational process actions `list`, `poll`, `log`, and `wait` are
+notified and auto-approved in `ops_guarded`; `kill`, `write`/`submit`, and
+unknown process actions remain manually gated.
 
 Configure the Telegram token and restrict access to trusted user IDs. The production-oriented personality is available at [`deploy/strict-ops/SOUL.md`](deploy/strict-ops/SOUL.md); install it as `~/.hermes/SOUL.md`.
 

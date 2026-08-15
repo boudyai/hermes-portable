@@ -841,6 +841,68 @@ def test_ops_guarded_readonly_notification_failure_blocks_execution(strict_env, 
     assert strict_env.status(seen["approval_id"]) == "blocked"
 
 
+@pytest.mark.parametrize("action", ["list", "poll", "log", "wait"])
+def test_ops_guarded_observational_process_actions_are_auto_approved(
+    strict_env, tmp_path, action
+):
+    _latch_mode(tmp_path, approval.OPS_GUARDED_MODE)
+    seen = _auto_notify_seen()
+    args = {"action": action}
+    if action != "list":
+        args["session_id"] = "proc_3ffe7ba28a55"
+    if action == "wait":
+        args["timeout"] = 120
+
+    invocation = approval.require_tool_approval(
+        "process",
+        args,
+        tool_call_id=f"process-{action}-1",
+        session_id="conversation-1",
+    )
+
+    assert invocation is not None
+    assert seen["auto_approved"] is True
+    assert strict_env.status(seen["approval_id"]) == "approved"
+
+
+@pytest.mark.parametrize("action", ["kill", "write", "submit"])
+def test_ops_guarded_mutating_process_actions_stay_manual(
+    strict_env, tmp_path, action
+):
+    _latch_mode(tmp_path, approval.OPS_GUARDED_MODE)
+    seen = _auto_notify_seen()
+    result = {}
+
+    def worker():
+        try:
+            result["value"] = approval.require_tool_approval(
+                "process",
+                {
+                    "action": action,
+                    "session_id": "proc_3ffe7ba28a55",
+                    "data": "yes",
+                },
+                tool_call_id=f"process-{action}-1",
+                session_id="conversation-1",
+            )
+        except BaseException as exc:
+            result["error"] = exc
+
+    thread = threading.Thread(target=worker)
+    thread.start()
+    for _ in range(100):
+        if seen:
+            break
+        time.sleep(0.01)
+    assert seen["auto_approved"] is False
+    assert approval.resolve_approval(
+        seen["approval_id"], "deny",
+        telegram_user_id="100", telegram_chat_id="200",
+    )
+    thread.join(2)
+    assert "denied" in str(result["error"]).lower()
+
+
 @pytest.mark.parametrize(
     "tool_name",
     [

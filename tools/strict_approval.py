@@ -51,6 +51,7 @@ OPS_GUARDED_AUTO_TOOLS = frozenset({
     "skills_list",
     "wiki_read",
 })
+OPS_GUARDED_PROCESS_ACTIONS = frozenset({"list", "poll", "log", "wait"})
 
 
 class StrictApprovalError(RuntimeError):
@@ -880,6 +881,13 @@ def require_tool_approval(
             str(tool_name) == "terminal"
             and is_ops_guarded_codex_command(command_args, Path(profile_home))
         )
+    if (
+        not auto_approved
+        and active_mode == OPS_GUARDED_MODE
+        and str(tool_name) == "process"
+    ):
+        process_args = args if isinstance(args, Mapping) else {}
+        auto_approved = process_args.get("action") in OPS_GUARDED_PROCESS_ACTIONS
     decision_status = "approved" if auto_approved else "pending"
     pending_data["decision_mac"] = _decision_mac(mac_key, pending_data, decision_status)
     if auto_approved:
