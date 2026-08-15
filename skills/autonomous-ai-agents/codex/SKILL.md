@@ -38,6 +38,37 @@ standalone Codex CLI, a valid CLI OAuth session may live under
 `~/.codex/auth.json`; do not treat a missing `OPENAI_API_KEY` alone as proof
 that Codex auth is missing.
 
+## Multi-Account Setup (lab-hermes)
+
+On lab-hermes, Codex CLI v0.147.0 is installed with 2 accounts for rate-limit
+fallback. Auth files:
+
+- `~/.codex/auth.account1.json` — account 1 (default active)
+- `~/.codex/auth.account2.json` — account 2 (fallback)
+- `~/.codex/auth.json` — symlink → active account
+
+Switch accounts:
+```bash
+ln -sf ~/.codex/auth.account1.json ~/.codex/auth.json  # or account2
+```
+
+Full setup details: wiki `references/codex-consultant.md`.
+
+## Consultant Mode (ZDR Boundary)
+
+Codex's backing model has **NO Zero Data Retention**. When using Codex from
+a Hermes context that manages infrastructure (e.g. lab-hermes ops), ALWAYS
+sanitize prompts:
+
+- Remove all IPs, hostnames, SSH credentials, secrets, tokens, keys
+- Replace specific topology with generic terms (host-A, db-server, reverse proxy)
+- No PII
+
+Safe to consult about: architecture patterns, algorithms, best practices,
+generic code review, technology tuning guides.
+
+See wiki `references/codex-consultant.md` for full sanitization checklist.
+
 ## One-Shot Tasks
 
 ```
@@ -86,7 +117,7 @@ when the same command works in the user's interactive shell. A typical symptom i
 bubblewrap/user-namespace errors such as `setting up uid map: Permission denied`
 or `loopback: Failed RTM_NEWADDR: Operation not permitted`.
 
-In that context, prefer:
+If `workspace-write` fails, fall back to:
 
 ```
 codex exec --sandbox danger-full-access "<task>"
@@ -95,6 +126,24 @@ codex exec --sandbox danger-full-access "<task>"
 Use process boundaries as the safety layer instead: explicit `workdir`, clean git
 status before launch, narrow task prompts, `git diff` review, targeted tests, and
 human/agent confirmation before committing broad changes.
+
+### lab-hermes: workspace-write works
+
+On lab-hermes (LXC 121, Ubuntu 24.04), `--sandbox workspace-write` was tested
+and works. Codex is restricted to `[workdir, /tmp, $TMPDIR]` — it cannot read
+`/root/wiki/`, `~/.hermes/`, `~/.codex/`, or any other path outside the workdir.
+
+**Always use `--sandbox workspace-write` on lab-hermes.** This is the safety
+boundary for consultant mode — even if a prompt contains sensitive data by
+mistake, Codex cannot access the filesystem beyond the temp workdir.
+
+Use a temp directory for consultations:
+```bash
+cd $(mktemp -d) && git init && codex exec --sandbox workspace-write "<prompt>"
+```
+
+Only fall back to `--sandbox danger-full-access` if `workspace-write` breaks
+after a system update, and document the reason.
 
 ## PR Reviews
 

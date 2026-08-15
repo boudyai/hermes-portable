@@ -75,6 +75,18 @@ The list may narrow the built-in seven-tool allow-list but cannot widen it. Use 
 
 Independently of `auto_approve_tools`, `ops_guarded` also auto-authorizes `terminal` and `remote_terminal` calls whose `command` is provably read-only: every simple command across pipes/`&&`/`;`/newlines must be in a fixed allow-list (`ls`, `cat`, `grep`, `find`, `docker ps|logs|inspect`, `systemctl status|show`, ...), with no command substitution, no heredocs, no output redirection except to `/dev/null`, and no references to sensitive paths (`.env`, `~/.ssh`, private keys, `/etc/shadow`, the approval store itself, ...). Anything the classifier cannot prove safe — including ambiguous cases — falls back to the manual 🥦/🦀 prompt. The boundary is hardcoded and cannot be widened from config.
 
+`ops_guarded` also recognizes a narrow set of local Codex CLI control calls:
+version/login status, device login, exact account-symlink switching, scratch
+`mktemp -d`/`git init`, process inspection, and `codex exec`. Auto-approved
+`codex exec` requires an explicit non-Hermes workdir plus
+`--sandbox workspace-write -m gpt-5.6-sol` and the sole config override
+`-c model_reasoning_effort=medium|high` (the server skill may add `--ephemeral`,
+`--ignore-user-config`, and `--ignore-rules` for further isolation). The exact
+`cd $(mktemp -d) && git init && codex exec --sandbox workspace-write ...`
+scratch form is also recognized. Full-access/bypass flags, extra writable
+directories, arbitrary shell composition, remote execution, and reading
+`~/.codex/auth*.json` stay manually gated.
+
 Configure the Telegram token and restrict access to trusted user IDs. The production-oriented personality is available at [`deploy/strict-ops/SOUL.md`](deploy/strict-ops/SOUL.md); install it as `~/.hermes/SOUL.md`.
 
 ## Run

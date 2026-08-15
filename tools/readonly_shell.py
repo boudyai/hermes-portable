@@ -43,7 +43,7 @@ _SIMPLE_READONLY = frozenset({
     "whoami", "id", "stat", "readlink", "realpath",
     "basename", "dirname", "cut", "tr", "true", "false", "test", "[",
     "lsblk", "netstat", "vmstat", "iostat", "lscpu", "lsmem",
-    "lsof", "nproc", "arch", "tty", "logname", "groups", "which",
+    "lsof", "nproc", "arch", "tty", "logname", "groups", "which", "pgrep",
     "type", "systemd-detect-virt", "cmp", "comm", "strings",
     "md5", "md5sum", "sha1sum", "sha224sum", "sha256sum", "sha384sum",
     "sha512sum", "shasum",
@@ -515,6 +515,18 @@ def _check_simple_command(argv: list[str]) -> None:
 
     name = _trusted_command_name(argv[0])
     rest = argv[1:]
+
+    # Codex OAuth files contain bearer/refresh credentials. Metadata commands
+    # such as ls/stat/readlink remain useful, but content readers (including
+    # wildcard forms such as ``cat ~/.codex/*``) must never silently copy
+    # anything from that private directory into the model context.
+    codex_metadata_commands = {
+        "ls", "stat", "readlink", "realpath", "basename", "dirname",
+    }
+    if name not in codex_metadata_commands and any(
+        re.search(r"(^|/)\.codex/", token) for token in rest
+    ):
+        raise _Unsafe("Codex private state contents are sensitive")
 
     if name in _SIMPLE_READONLY:
         return

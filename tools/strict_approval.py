@@ -34,6 +34,7 @@ from pathlib import Path
 from typing import Any, Callable, Iterator, Mapping
 
 from hermes_constants import get_hermes_home
+from tools.codex_shell import is_ops_guarded_codex_command
 from tools.readonly_shell import READONLY_SHELL_TOOLS, is_readonly_shell_command
 
 logger = logging.getLogger(__name__)
@@ -872,8 +873,12 @@ def require_tool_approval(
         # PTYs can activate configured pagers (systemctl/journalctl/etc.),
         # which turns an observational command into arbitrary child-process
         # execution. Foreground/background pipe execution remains eligible.
-        auto_approved = not bool(command_args.get("pty")) and is_readonly_shell_command(
-            command_args.get("command")
+        auto_approved = (
+            not bool(command_args.get("pty"))
+            and is_readonly_shell_command(command_args.get("command"))
+        ) or (
+            str(tool_name) == "terminal"
+            and is_ops_guarded_codex_command(command_args, Path(profile_home))
         )
     decision_status = "approved" if auto_approved else "pending"
     pending_data["decision_mac"] = _decision_mac(mac_key, pending_data, decision_status)

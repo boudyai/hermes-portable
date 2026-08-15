@@ -693,6 +693,68 @@ def test_ops_guarded_readonly_terminal_with_pty_stays_manual(strict_env, tmp_pat
     assert "denied" in str(result["error"]).lower()
 
 
+def test_ops_guarded_sandboxed_codex_exec_with_pty_is_auto_approved(
+    strict_env, tmp_path
+):
+    _latch_mode(tmp_path, approval.OPS_GUARDED_MODE)
+    seen = _auto_notify_seen()
+    workdir = tmp_path.parent / f"codex-project-{tmp_path.name}"
+    workdir.mkdir(exist_ok=True)
+
+    invocation = approval.require_tool_approval(
+        "terminal",
+        {
+            "command": (
+                "codex exec --sandbox workspace-write --ephemeral "
+                "--ignore-user-config --ignore-rules -m gpt-5.6-sol "
+                "-c model_reasoning_effort=medium 'review this project'"
+            ),
+            "workdir": str(workdir),
+            "pty": True,
+            "background": True,
+        },
+        tool_call_id="codex-terminal-1",
+        session_id="conversation-1",
+    )
+
+    assert invocation is not None
+    assert seen["auto_approved"] is True
+    assert strict_env.status(seen["approval_id"]) == "approved"
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "codex exec --sandbox danger-full-access 'read the wiki'",
+        "codex exec --sandbox workspace-write -m gpt-5.6-sol "
+        "-c 'sandbox_permissions=[\"disk-full-read-access\"]' 'inspect'",
+    ],
+)
+def test_ops_guarded_dangerous_codex_settings_stay_manual(
+    strict_env, tmp_path, command
+):
+    _latch_mode(tmp_path, approval.OPS_GUARDED_MODE)
+    workdir = tmp_path.parent / f"codex-project-danger-{tmp_path.name}"
+    workdir.mkdir(exist_ok=True)
+    seen, result, thread = _wait_for_prompt(
+        None,
+        strict_env,
+        {
+            "command": command,
+            "workdir": str(workdir),
+            "pty": True,
+        },
+    )
+
+    assert seen["auto_approved"] is False
+    assert approval.resolve_approval(
+        seen["approval_id"], "deny",
+        telegram_user_id="100", telegram_chat_id="200",
+    )
+    thread.join(2)
+    assert "denied" in str(result["error"]).lower()
+
+
 def test_ops_guarded_readonly_remote_terminal_command_auto_approved(strict_env, tmp_path):
     _latch_mode(tmp_path, approval.OPS_GUARDED_MODE)
     seen = _auto_notify_seen()
