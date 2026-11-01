@@ -112,7 +112,9 @@ def _checked_entry(authority, receipt, source, route):
 def owned_receipt(authority, sid):
     """*sid*'s stored receipt with its LOCAL source, route and entry, once all are this owner's."""
     receipt = local_receipt(authority.db, sid)
-    if receipt['profile_id'] != authority.profile_id:
+    from gateway.session_portability import paired
+    if receipt['profile_id'] != authority.profile_id and not paired(
+            authority, receipt['profile_id'], receipt['principal_id']):
         raise RuntimeStoreError('profile_mismatch')
     chat_id = (receipt['legacy_session_id'] if 'legacy_session_id' in receipt else
                local_identity(receipt['profile_id'], receipt['principal_id'], receipt['request_id']))
@@ -159,7 +161,7 @@ def restore_local_session(authority, sid):
         receipt, source, route, entry = owned_receipt(authority, sid)
         chat_id, store = source.chat_id, authority.runner.session_store
         adopted = _with_untracked_compression(authority, sid, receipt)
-        policy = restore_policy(adopted['policy'])
+        policy = restore_policy(adopted['policy'], authority=authority, runtime=True)
         if adopted is not receipt:  # re-read after a catch-up: check the copy that will be served
             receipt, entry = adopted, _checked_entry(authority, adopted, source, route)
         target = entry.session_id

@@ -80,8 +80,9 @@ def _bootstrap(authority, ref, row, policy, scope, text=None):
     config = _worker_config(authority, policy)
     hydrated = replace(policy, config_json=json.dumps(config), request_json=json.dumps(request),
                        terminal_json=json.dumps(terminal), credential_ref=None, config_secret_ref=None)
+    from gateway.session_portability import execution_policy
     return {'version': 1, 'home': authority.profile_id, 'scope': scope,
-            'policy': asdict(hydrated), 'api_key': route_launch_key(authority, policy, config),
+            'policy': execution_policy(hydrated), 'api_key': route_launch_key(authority, policy, config),
             'text': row['payload']['text'] if text is None else text, 'route': live.route,
             **({'attachments_v1': row['payload']['attachments_v1']} if 'attachments_v1' in row['payload'] else {}),
             'user_id': live.source.user_id, 'chat_id': live.source.chat_id,

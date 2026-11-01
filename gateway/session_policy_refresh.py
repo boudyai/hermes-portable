@@ -145,7 +145,7 @@ def _prepare(authority, session_id, mcp_only=False, adopt_only=False):
     from tools.terminal_scope import build_profile_terminal_scope
     generation = authority.db.get_session(session_id)['runtime_generation']
     stored = local_receipt(authority.db, session_id)['policy']
-    old = restore_policy(stored)
+    old = restore_policy(stored, authority=authority)
     # A bypass launch never reads the profile; cron, Kanban and room routes are not resumed CLI sessions.
     if old.ignore_user_config or old.source not in SURFACES:
         return None
@@ -231,6 +231,9 @@ async def _commit_refresh(authority, ref, mcp_only, adopt_only=False):
         pending.add(ref.session_id)  # until this commit lands
     moved = json.loads(policy.terminal_json) != json.loads(old.terminal_json)
     policy = _rebind(authority, ref.session_id, old, policy, secrets, replaced)
+    # Refuse an unsupported cross-host refresh before committing an unpublishable policy.
+    from gateway.session_portability import runtime_policy
+    runtime_policy(authority, policy)
     # Compare-and-swap against the receipt as stored (JSON lists), not its restored tuple form. The
     # publication is the commit's own shielded follow-up: a caller cancelled mid-commit cannot leave the
     # stored policy ahead of the live one (restore_local_session refuses that pair).

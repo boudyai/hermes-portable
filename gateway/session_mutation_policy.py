@@ -23,7 +23,7 @@ async def prepare_reasoning(authority, live, payload, prepared):
     """``/reasoning <level>`` for this session: the level ``build_policy`` freezes at creation. ``None``
     (``/reasoning reset``) gives the level back to the profile."""
     from gateway.session_policy import pin_reasoning_effort, profile_config, restore_policy, unpin_reasoning
-    old = restore_policy(prepared['snapshot']['receipt']['policy'])
+    old = restore_policy(prepared['snapshot']['receipt']['policy'], authority=authority)
     frozen = old.config()
     if payload['effort'] is not None:
         pin_reasoning_effort(frozen, payload['effort'], session=True)
@@ -40,7 +40,7 @@ async def prepare_workspace(authority, live, payload, prepared):
     from gateway.session_policy import restore_policy
     from hermes_constants import translate_cwd_for_wsl_backend
     from tui_gateway import git_probe
-    old = restore_policy(prepared['snapshot']['receipt']['policy'])
+    old = restore_policy(prepared['snapshot']['receipt']['policy'], authority=authority)
 
     def probe():
         # Off-loop: a stat and up to three `git` spawns.
@@ -49,6 +49,10 @@ async def prepare_workspace(authority, live, payload, prepared):
             raise RuntimeStoreError('invalid_params')
         return cwd, git_probe.branch(cwd), git_probe.common_repo_root(cwd)
     cwd, branch, root = await asyncio.to_thread(probe)
+    from pathlib import Path
+    if not Path(old.cwd).is_absolute():
+        from gateway.session_portability import project_path
+        cwd = project_path(authority, cwd, reverse=True)
     terminal = json.loads(old.terminal_json)
     terminal['TERMINAL_CWD'] = cwd
     policy = replace(old, cwd=cwd, terminal_json=json.dumps(terminal))
@@ -59,7 +63,7 @@ async def prepare_edit_policy(authority, live, payload, prepared):
     """Main's ACP modes (Default / Accept Edits / Don't Ask) as the session's frozen edit approval
     policy. Only an ACP session's edits ask an editor; selecting the current policy writes nothing."""
     from gateway.session_policy import restore_policy
-    old = restore_policy(prepared['snapshot']['receipt']['policy'])
+    old = restore_policy(prepared['snapshot']['receipt']['policy'], authority=authority)
     if old.source != 'acp':
         raise RuntimeStoreError('invalid_params', field='payload.policy',
                                 detail='only an ACP session has an editor edit approval policy')

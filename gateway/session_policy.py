@@ -889,7 +889,7 @@ def rebind_launch_key(authority, session, api_key):
     if source is None or source.platform != Platform.LOCAL:
         raise RuntimeStoreError('admission_conflict')
     from hermes_state_local import local_receipt
-    ref = restore_policy(local_receipt(authority.db, session.session_id)['policy']).credential_ref
+    ref = restore_policy(local_receipt(authority.db, session.session_id)['policy'], authority=authority).credential_ref
     if ref is None:
         raise RuntimeStoreError('admission_conflict')
     keys = getattr(authority, '_local_launch_keys', None)
@@ -977,7 +977,7 @@ def route_launch_key(authority, policy, config):
     return launch_key(authority, policy)
 
 
-def restore_policy(data):
+def restore_policy(data, *, authority=None, runtime=False):
     """Reject incomplete private policy rather than rebuilding from current defaults."""
     try:
         policy = LocalSessionPolicy(**data)
@@ -985,7 +985,8 @@ def restore_policy(data):
         surfaces = {**SURFACES, 'cron': 'cron', 'kanban': 'cli', 'bot_room': 'bot_room'}
         if ((not is_forward_policy(policy) and
              (policy.source not in surfaces or policy.platform != surfaces[policy.source]))
-                or not isinstance(policy.cwd, str) or not Path(policy.cwd).is_absolute()
+                or not isinstance(policy.cwd, str) or not (Path(policy.cwd).is_absolute()
+                    or (authority is not None and _portable_cwd(authority, policy.cwd)))
                 or not isinstance(policy.model, str) or not policy.model.strip()
                 or not isinstance(policy.toolsets, (list, tuple))
                 or any(not isinstance(name, str) for name in policy.toolsets)
@@ -1005,9 +1006,19 @@ def restore_policy(data):
         terminal = json.loads(policy.terminal_json)
         if terminal_uses_host_cwd(terminal) and terminal.get('TERMINAL_CWD') != policy.cwd:
             raise ValueError('terminal policy mismatch')
-        return replace(policy, toolsets=tuple(policy.toolsets))
+        policy = replace(policy, toolsets=tuple(policy.toolsets))
+        if runtime:
+            from gateway.session_portability import runtime_policy
+            policy = runtime_policy(authority, policy)
+        return policy
     except (KeyError, TypeError, ValueError) as exc:
         raise RuntimeStoreError('storage_unavailable') from exc
+
+
+def _portable_cwd(authority, cwd):
+    from gateway.session_portability import local_cwd
+    local_cwd(authority, cwd)
+    return True
 
 
 def _valid_client_env(value, kind: type = str):

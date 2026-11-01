@@ -364,7 +364,7 @@ def _session_servers(authority, sid, ready):
     from gateway.session_policy import restore_policy
     from hermes_cli.tools_config import enabled_mcp_server_names
     from hermes_state_local import local_receipt
-    policy = restore_policy(local_receipt(authority.db, sid)['policy'])
+    policy = restore_policy(local_receipt(authority.db, sid)['policy'], authority=authority)
     return sorted(set(policy.toolsets) & enabled_mcp_server_names(json.loads(policy.config_json)) & set(ready))
 
 

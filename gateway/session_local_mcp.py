@@ -238,6 +238,9 @@ def rebind_editor_mcp(authority, sid, policy, servers):
     toolsets = {name for name in policy.toolsets if not _frozen_toolset(old, name)}
     data = None
     if servers:
+        from pathlib import Path
+        if not Path(policy.cwd).is_absolute():
+            raise RuntimeStoreError('storage_unavailable', field='portable_sessions', detail='host-bound editor discovery')
         scope = session_scope(authority, sid)
         held = _held(authority, scope)
         with held.lock:
@@ -311,7 +314,7 @@ def install_editor_mcp(authority, sid, servers):
     """After a committed change: *sid*'s borrowed credentials follow its committed policy (memory only)."""
     from gateway.session_policy import restore_policy
     from hermes_state_local import local_receipt
-    policy = restore_policy(local_receipt(authority.db, sid)['policy'])
+    policy = restore_policy(local_receipt(authority.db, sid)['policy'], authority=authority)
     data = json.loads(policy.editor_mcp_json or '{}')
     borrowed = getattr(authority, '_local_editor_mcp', None)
     if borrowed is None:
@@ -337,7 +340,7 @@ async def prepare_editor_mcp(authority, live, payload, prepared, *, servers):
     from gateway.session_mutation_policy import _rebind
     from gateway.session_policy import restore_policy
     receipt = prepared['snapshot']['receipt']
-    old = restore_policy(receipt['policy'])
+    old = restore_policy(receipt['policy'], authority=authority)
     if old.source != 'acp':
         raise RuntimeStoreError('invalid_params')
     policy, changed = await asyncio.to_thread(rebind_editor_mcp, authority, receipt['session_id'], old, servers)
@@ -414,7 +417,7 @@ async def _refreeze(authority, ref):
     from hermes_state_local import local_receipt
     # The committed policy the claim just restored (``restore_local_session``).
     receipt = await asyncio.to_thread(local_receipt, authority.db, ref.session_id)
-    policy = restore_policy(receipt['policy'])
+    policy = restore_policy(receipt['policy'], authority=authority, runtime=True)
     if not policy.editor_mcp_json:
         return
     data = json.loads(policy.editor_mcp_json)
@@ -473,7 +476,7 @@ async def prepare_branch_editor(authority, ref, servers, gate):
         saved = await asyncio.to_thread(local_receipt, authority.db, ref.session_id)
     except RuntimeStoreError:
         return None, None  # not a local session: the branch transaction refuses it
-    parent = restore_policy(saved['policy'])
+    parent = restore_policy(saved['policy'], authority=authority)
     if servers is None:
         if not parent.editor_mcp_json:
             return None, None

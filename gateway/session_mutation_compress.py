@@ -39,7 +39,7 @@ async def prepare_compress(authority, live, payload, prepared):
     from utils import is_truthy_value
     request = compress_request(payload)
     snapshot = prepared['snapshot']
-    policy = restore_policy(snapshot['receipt']['policy'])
+    policy = restore_policy(snapshot['receipt']['policy'], authority=authority, runtime=True)
     config = policy.config(authority)
     options = config.get('compression') or {}
     if options.get('checkpoint_required'):
