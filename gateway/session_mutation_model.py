@@ -47,7 +47,7 @@ async def prepare_model(authority, live, payload, prepared):
     from gateway.session_policy_credentials import recover_config_secrets
     from hermes_cli.model_switch import apply_model_selection, switch_model
     from hermes_cli.config import get_compatible_custom_providers
-    old = restore_policy(prepared['snapshot']['receipt']['policy'])
+    old = restore_policy(prepared['snapshot']['receipt']['policy'], authority=authority)
     config, current = _current_route(authority, live, old)
     reset = is_model_reset(payload)
     if reset:

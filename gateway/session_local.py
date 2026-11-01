@@ -390,7 +390,7 @@ def publish_local_policy(authority, session_id, *, evict=True):
     live = authority.sessions[session_id]
     from gateway.session_local_recovery import local_adapter_map
     adapter = local_adapter_map(authority)[Platform.LOCAL]
-    adapter.policies[live.source.chat_id] = restore_policy(local_receipt(authority.db, session_id)['policy'])
+    adapter.policies[live.source.chat_id] = restore_policy(local_receipt(authority.db, session_id)['policy'], authority=authority, runtime=True)
     if evict:
         authority.runner._evict_cached_agent(live.route)
 

@@ -58,7 +58,8 @@ class RecoveredSecrets(dict):
 
 
 def policy_identity(policy, unhashed=()):
-    data = asdict(policy)
+    from gateway.session_portability import durable_policy
+    data = durable_policy(policy)
     data.pop('credential_ref')
     data.pop('config_secret_ref')
     # Fields added after release are hashed only when set, so an older session's reference still matches.
@@ -212,8 +213,10 @@ def _check_scope(authority, source, policy, home, skip):
     """Refuse, by name, a reference from another home or profile, or a secret whose endpoint the policy
     moved without re-binding it. A change to anything else in the policy (model name, reasoning, toolsets,
     an unrelated provider or MCP server, a policy field a later release added) is not a credential change."""
+    from gateway.session_portability import credential_scope
+    portable = credential_scope(authority, source)
     for name, mine in (('home', str(home)), ('profile', authority.profile_id)):
-        if source[name] != mine:
+        if source[name] != mine and not portable:
             raise RuntimeStoreError('launch_credentials_unavailable', field=name,
                                     detail=f'the frozen config credentials belong to another {name}')
     if 'bound' not in source:

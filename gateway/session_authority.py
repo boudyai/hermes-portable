@@ -232,8 +232,11 @@ class SessionAuthority:
         from gateway.config import Platform
         source = self.sessions[ref.session_id].source
         from gateway.owner_identity import same_owner
+        from gateway.session_portability import receipt_access
+        from hermes_state_local import local_receipt
         if (source is not None and source.platform == Platform.LOCAL
-                and not same_owner(source.user_id, actor.subject) and 'session:operator' not in actor.capabilities):
+                and not same_owner(source.user_id, actor.subject) and 'session:operator' not in actor.capabilities
+                and not receipt_access(self, local_receipt(self.db, ref.session_id), actor.subject)):
             raise RuntimeStoreError('permission_denied')
         from gateway.session_retirement import touch_restored
         touch_restored(self, ref.session_id)  # a rename or a read brought a retired one back
