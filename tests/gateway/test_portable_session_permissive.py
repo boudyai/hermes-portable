@@ -97,7 +97,7 @@ async def test_permissive_preserves_explicit_ssh_backend(portable):
 async def test_permissive_cold_attach_unmapped_windows_receipt(tmp_path, monkeypatch):
     from gateway import run
     from gateway.session_authority import initialize_session_authority
-    from gateway.session_contract import Principal, SessionRef
+    from gateway.session_contract import SessionActor, SessionRef
     from hermes_state_runtime import begin_runtime_epoch
     from hermes_state_local import local_receipt
     from tests.gateway.test_portable_session_contract import _enroll, _runner, _windows_receipt, CAPS
@@ -117,7 +117,7 @@ async def test_permissive_cold_attach_unmapped_windows_receipt(tmp_path, monkeyp
                 'mcp_servers': {'win': {'command': r'C:\tools\mcp.exe'}},
                 'browser': {'browserbase': False}})
         authority = await initialize_session_authority(runner, profile_id=str(tmp_path), instance_id='linux')
-        actor = Principal('uid:1000', str(tmp_path), CAPS, 'socket')
+        actor = SessionActor('uid:1000', str(tmp_path), CAPS, 'socket')
         snapshot = await authority.attach(actor, SessionRef(str(tmp_path), saved['session_id']))
         assert snapshot.history[0]['content'] == 'Windows history'
         from gateway.config import Platform

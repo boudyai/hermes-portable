@@ -14,7 +14,7 @@ from tests.gateway.test_portable_session_contract import (
 async def portable(tmp_path, monkeypatch, request):
     from gateway import run
     from gateway.session_authority import initialize_session_authority
-    from gateway.session_contract import Principal, SessionRef
+    from gateway.session_contract import SessionActor, SessionRef
     from hermes_state_runtime import begin_runtime_epoch
     monkeypatch.setenv('HERMES_HOME', str(tmp_path))
     monkeypatch.setattr(run, '_load_gateway_config', lambda *a: {'platform_toolsets': {'cli': []}})
@@ -27,7 +27,7 @@ async def portable(tmp_path, monkeypatch, request):
         config={'compression': {'in_place': getattr(request, 'param', True)}})
     runner._resolve_session_agent_runtime = lambda **kw: ('fixture', {})
     authority = await initialize_session_authority(runner, profile_id=str(tmp_path), instance_id='linux')
-    actor = Principal('uid:1000', str(tmp_path), CAPS, 'socket')
+    actor = SessionActor('uid:1000', str(tmp_path), CAPS, 'socket')
     ref = SessionRef(str(tmp_path), saved['session_id'])
     try:
         await authority.attach(actor, ref)

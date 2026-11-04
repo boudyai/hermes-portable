@@ -79,7 +79,7 @@ def _enroll(home, workspace):
 async def test_enrolled_windows_receipt_restores_writes_and_restarts(tmp_path, monkeypatch):
     from gateway import run
     from gateway.session_authority import initialize_session_authority
-    from gateway.session_contract import Principal, SessionRef, Submission
+    from gateway.session_contract import SessionActor, SessionRef, Submission
     from gateway.session_mutations import mutate_session
     from hermes_state_local import local_receipt
     from hermes_state_runtime import begin_runtime_epoch, list_session_admissions
@@ -104,7 +104,7 @@ async def test_enrolled_windows_receipt_restores_writes_and_restarts(tmp_path, m
     monkeypatch.setattr('gateway.session_finite.execute_finite_admission', execute)
     try:
         authority = await initialize_session_authority(runner, profile_id=str(tmp_path), instance_id='linux')
-        actor = Principal('uid:1000', str(tmp_path), CAPS, 'socket')
+        actor = SessionActor('uid:1000', str(tmp_path), CAPS, 'socket')
         ref = SessionRef(str(tmp_path), sid)
         snapshot = await authority.attach(actor, ref)
         assert snapshot.history[0]['content'] == 'Windows history'
@@ -156,7 +156,7 @@ async def test_enrolled_windows_receipt_restores_writes_and_restarts(tmp_path, m
 async def test_unenrolled_cross_profile_receipt_fails_closed(tmp_path, monkeypatch):
     from gateway import run
     from gateway.session_authority import initialize_session_authority
-    from gateway.session_contract import Principal, SessionRef
+    from gateway.session_contract import SessionActor, SessionRef
     from hermes_state_local import local_receipt
     from hermes_state_runtime import RuntimeStoreError, begin_runtime_epoch
     monkeypatch.setenv('HERMES_HOME', str(tmp_path))
@@ -167,7 +167,7 @@ async def test_unenrolled_cross_profile_receipt_fails_closed(tmp_path, monkeypat
                                   instance_id='fixture-windows'), workspace=tmp_path, windows_policy=False)
         authority = await initialize_session_authority(runner, profile_id=str(tmp_path), instance_id='linux')
         with pytest.raises(RuntimeStoreError, match='profile_mismatch'):
-            await authority.attach(Principal('uid:1000', str(tmp_path), CAPS, 'socket'),
+            await authority.attach(SessionActor('uid:1000', str(tmp_path), CAPS, 'socket'),
                                    SessionRef(str(tmp_path), saved['session_id']))
         assert local_receipt(authority.db, saved['session_id']) == saved
     finally:
